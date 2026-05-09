@@ -7,6 +7,13 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.3.33] — 2026-05-09
+
+### Added
+- **CloudFormation `AWS::DynamoDB::GlobalTable`** — covers the schema CDK `TableV2` emits. Honors `KeySchema`, `AttributeDefinitions`, `BillingMode`, `StreamSpecification`, `GlobalSecondaryIndexes`, `LocalSecondaryIndexes`, `SSESpecification`, `TimeToLiveSpecification`, and `TableName`. For PROVISIONED billing, `WriteProvisionedThroughputSettings.WriteCapacityAutoScalingSettings.MinCapacity` and `ReadProvisionedThroughputSettings.ReadCapacityAutoScalingSettings.MinCapacity` are translated to the engine's static `ProvisionedThroughput.{Write,Read}CapacityUnits` (since a single-process emulator doesn't simulate auto-scaling). `Replicas` is accepted and ignored — cross-region replication has no meaning here — along with `MultiRegionConsistency`, `GlobalTableWitnesses`, `GlobalTableSourceArn`, `WarmThroughput`, `ReadOnDemandThroughputSettings`, and `WriteOnDemandThroughputSettings`. Stacks that mix `AWS::DynamoDB::Table` and `AWS::DynamoDB::GlobalTable` deploy unmodified. Reported by @youngkwangk.
+
+---
+
 ## [1.3.32] — 2026-05-09
 
 ### Added
