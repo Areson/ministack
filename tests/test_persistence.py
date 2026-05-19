@@ -34,6 +34,43 @@ def _module(mod_name):
     return importlib.import_module(f"ministack.services.{mod_name}")
 
 
+def test_account_region_scoped_dict_persistence_round_trip(monkeypatch, tmp_path):
+    """Account+region scoped stores must survive the JSON persistence path."""
+    from ministack.core.responses import (
+        AccountRegionScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+
+    original_account = get_account_id()
+    original_region = get_region()
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    try:
+        store = AccountRegionScopedDict()
+        set_request_account_id("111111111111")
+        set_request_region("us-east-1")
+        store["same-name"] = {"region": "us-east-1"}
+        set_request_region("us-west-2")
+        store["same-name"] = {"region": "us-west-2"}
+
+        persistence.save_state("account-region-scoped", {"store": store})
+        loaded = persistence.load_state("account-region-scoped")
+        assert loaded is not None
+
+        restored = loaded["store"]
+        set_request_region("us-east-1")
+        assert restored["same-name"] == {"region": "us-east-1"}
+        set_request_region("us-west-2")
+        assert restored["same-name"] == {"region": "us-west-2"}
+    finally:
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
 @pytest.mark.parametrize("svc_key,mod_name", ALL_PERSISTED_SERVICES)
 def test_service_has_restore_path(svc_key, mod_name):
     """Every service in `_state_map` must expose a way to restore its own state.

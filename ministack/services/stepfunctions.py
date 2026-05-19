@@ -40,6 +40,7 @@ from datetime import datetime, timezone
 
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
@@ -119,24 +120,24 @@ def _get_mock_response(sm_name: str, test_case: str, state_name: str, attempt: i
                 continue
     return None
 
-_state_machines = AccountScopedDict()
-_executions = AccountScopedDict()
-_task_tokens = AccountScopedDict()
-_tags = AccountScopedDict()
-_activities = AccountScopedDict()
-_activity_tasks = AccountScopedDict()
+_state_machines = AccountRegionScopedDict()
+_executions = AccountRegionScopedDict()
+_task_tokens = AccountRegionScopedDict()
+_tags = AccountRegionScopedDict()
+_activities = AccountRegionScopedDict()
+_activity_tasks = AccountRegionScopedDict()
 
 # version_arn -> {stateMachineVersionArn, stateMachineRevisionId,
 #                 description, creationDate, definition, roleArn, type,
 #                 loggingConfiguration}
 # Version ARN shape: arn:aws:states:<region>:<acct>:stateMachine:<name>:<N>
-_state_machine_versions = AccountScopedDict()
+_state_machine_versions = AccountRegionScopedDict()
 
 # alias_arn -> {stateMachineAliasArn, name, description,
 #               routingConfiguration: [{stateMachineVersionArn, weight}],
 #               creationDate, updateDate}
 # Alias ARN shape: arn:aws:states:<region>:<acct>:stateMachine:<name>:<aliasName>
-_state_machine_aliases = AccountScopedDict()
+_state_machine_aliases = AccountRegionScopedDict()
 
 # ── Persistence ────────────────────────────────────────────
 
@@ -162,7 +163,7 @@ def restore_state(data):
     _state_machine_aliases.update(data.get("state_machine_aliases", {}))
     # Executions that were RUNNING when the process died cannot resume —
     # mark them FAILED, following the ECS precedent (tasks → STOPPED).
-    for exc in _executions.values():
+    for exc in _executions.all_values():
         if exc.get("status") == "RUNNING":
             exc["status"] = "FAILED"
             exc["stopDate"] = now_iso()
@@ -533,12 +534,12 @@ def _start_execution(data):
         ],
     }
 
-    # Propagate the request's contextvars (notably the account ID set by
-    # set_request_account_id) into the background execution thread. Python's
-    # threading.Thread does NOT automatically copy contextvars, so without
-    # this snapshot the worker runs under the default account and silently
-    # fails to find the execution stored in AccountScopedDict under the
-    # caller's account. See issue #639.
+    # Propagate the request-scoped account and Region context into the
+    # background execution thread. Issue #639 covered the original account
+    # context failure: threading.Thread does not copy contextvars, so the
+    # worker ran under the default account and missed the execution. With
+    # region-scoped Step Functions state, the same snapshot also keeps
+    # regional lookups bound to the caller's Region.
     ctx_snapshot = contextvars.copy_context()
     threading.Thread(
         target=ctx_snapshot.run,
@@ -1769,11 +1770,11 @@ def _execute_parallel(state_def, raw_input, execution, ctx):
         except Exception as exc:
             errors[idx] = exc
 
-    # Each branch runs in its own thread; propagate the parent's contextvars
-    # so AccountScopedDict lookups (account ID, region) keep resolving to the
-    # current execution's tenant. Take a fresh copy_context() per branch —
-    # a single Context cannot be entered by two threads concurrently. See
-    # issue #639.
+    # Each branch runs in its own thread; propagate the parent's contextvars.
+    # Issue #639 covered account-context loss in threaded SFN work; with
+    # region-scoped state, the copied context also keeps regional lookups bound
+    # to the current execution. Take a fresh copy_context() per branch —
+    # a single Context cannot be entered by two threads concurrently.
     threads = [
         threading.Thread(
             target=contextvars.copy_context().run,
@@ -1835,10 +1836,11 @@ def _execute_map(state_def, raw_input, execution, ctx):
 
     workers = max_conc if max_conc > 0 else (len(items) or 1)
     # ThreadPoolExecutor workers do not inherit the submitting thread's
-    # contextvars, so wrap each submitted callable with copy_context().run
-    # to keep AccountScopedDict lookups bound to the current tenant. Take
-    # a fresh copy_context() per item — a single Context cannot be entered
-    # by two threads concurrently. See issue #639.
+    # contextvars, so wrap each submitted callable with copy_context().run.
+    # Issue #639 covered account-context loss in threaded SFN work; with
+    # region-scoped state, the copied context also keeps regional lookups bound
+    # to the current execution. Take a fresh copy_context() per item — a
+    # single Context cannot be entered by two threads concurrently.
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futs = [
             pool.submit(contextvars.copy_context().run, run_item, i, item)

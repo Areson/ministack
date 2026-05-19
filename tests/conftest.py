@@ -45,10 +45,15 @@ def patch_endpoint_dns():
     socket.getaddrinfo = _real_getaddrinfo
 
 
-def make_client(service, additional_config_kwargs=None):
+def make_client(service, additional_config_kwargs=None, region_name=REGION):
     if additional_config_kwargs is None:
         additional_config_kwargs = {}
-    return boto3.client(service, **_default_kwargs, config=Config(**_default_config_kwargs, **additional_config_kwargs))
+    kwargs = dict(_default_kwargs)
+    kwargs["region_name"] = region_name
+    config_kwargs = dict(_default_config_kwargs)
+    config_kwargs["region_name"] = region_name
+    config_kwargs.update(additional_config_kwargs)
+    return boto3.client(service, **kwargs, config=Config(**config_kwargs))
 
 
 _SERIAL_TESTS = {

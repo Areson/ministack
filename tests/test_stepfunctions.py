@@ -8,6 +8,7 @@ from urllib.parse import urlparse
 
 import pytest
 from botocore.exceptions import ClientError
+from conftest import make_client
 
 
 def _make_zip(code: str) -> bytes:
@@ -26,6 +27,124 @@ def _wait_sfn(sfn, exec_arn, timeout=10):
         if desc["status"] != "RUNNING":
             return desc
     return desc
+
+
+def _regional_sfn(region):
+    return make_client("stepfunctions", region_name=region)
+
+
+def _pass_definition(result="ok"):
+    return json.dumps(
+        {
+            "StartAt": "P",
+            "States": {"P": {"Type": "Pass", "Result": result, "End": True}},
+        }
+    )
+
+
+def test_sfn_state_machines_are_region_scoped():
+    east = _regional_sfn("us-east-1")
+    west = _regional_sfn("us-west-2")
+    name = f"sfn-region-scope-{_uuid_mod.uuid4().hex}"
+
+    east_sm = east.create_state_machine(
+        name=name,
+        definition=_pass_definition("east"),
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+    west_sm = west.create_state_machine(
+        name=name,
+        definition=_pass_definition("west"),
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+
+    assert ":us-east-1:" in east_sm["stateMachineArn"]
+    assert ":us-west-2:" in west_sm["stateMachineArn"]
+    assert east_sm["stateMachineArn"] != west_sm["stateMachineArn"]
+
+    east_arns = {sm["stateMachineArn"] for sm in east.list_state_machines()["stateMachines"]}
+    west_arns = {sm["stateMachineArn"] for sm in west.list_state_machines()["stateMachines"]}
+    assert east_sm["stateMachineArn"] in east_arns
+    assert east_sm["stateMachineArn"] not in west_arns
+    assert west_sm["stateMachineArn"] in west_arns
+    assert west_sm["stateMachineArn"] not in east_arns
+
+    with pytest.raises(ClientError) as exc:
+        west.describe_state_machine(stateMachineArn=east_sm["stateMachineArn"])
+    assert exc.value.response["Error"]["Code"] == "StateMachineDoesNotExist"
+
+
+def test_sfn_executions_are_region_scoped():
+    east = _regional_sfn("us-east-1")
+    west = _regional_sfn("us-west-2")
+    name = f"sfn-exec-region-scope-{_uuid_mod.uuid4().hex}"
+    execution_name = "same-execution-name"
+
+    east_sm = east.create_state_machine(
+        name=name,
+        definition=_pass_definition("east"),
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+    west_sm = west.create_state_machine(
+        name=name,
+        definition=_pass_definition("west"),
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+
+    east_ex = east.start_execution(
+        stateMachineArn=east_sm["stateMachineArn"],
+        name=execution_name,
+        input="{}",
+    )
+    west_ex = west.start_execution(
+        stateMachineArn=west_sm["stateMachineArn"],
+        name=execution_name,
+        input="{}",
+    )
+
+    assert ":us-east-1:" in east_ex["executionArn"]
+    assert ":us-west-2:" in west_ex["executionArn"]
+    assert east_ex["executionArn"] != west_ex["executionArn"]
+
+    east_desc = _wait_sfn(east, east_ex["executionArn"])
+    west_desc = _wait_sfn(west, west_ex["executionArn"])
+    assert east_desc["status"] == "SUCCEEDED"
+    assert west_desc["status"] == "SUCCEEDED"
+    assert json.loads(east_desc["output"]) == "east"
+    assert json.loads(west_desc["output"]) == "west"
+
+    east_exec_arns = {
+        ex["executionArn"]
+        for ex in east.list_executions(stateMachineArn=east_sm["stateMachineArn"])["executions"]
+    }
+    west_exec_arns = {
+        ex["executionArn"]
+        for ex in west.list_executions(stateMachineArn=west_sm["stateMachineArn"])["executions"]
+    }
+    assert east_ex["executionArn"] in east_exec_arns
+    assert east_ex["executionArn"] not in west_exec_arns
+    assert west_ex["executionArn"] in west_exec_arns
+    assert west_ex["executionArn"] not in east_exec_arns
+
+    with pytest.raises(ClientError) as exc:
+        west.describe_execution(executionArn=east_ex["executionArn"])
+    assert exc.value.response["Error"]["Code"] == "ExecutionDoesNotExist"
+
+
+def test_sfn_start_execution_rejects_cross_region_state_machine_arn():
+    east = _regional_sfn("us-east-1")
+    west = _regional_sfn("us-west-2")
+    name = f"sfn-cross-region-start-{_uuid_mod.uuid4().hex}"
+    east_sm = east.create_state_machine(
+        name=name,
+        definition=_pass_definition("east"),
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+
+    with pytest.raises(ClientError) as exc:
+        west.start_execution(stateMachineArn=east_sm["stateMachineArn"], input="{}")
+    assert exc.value.response["Error"]["Code"] == "StateMachineDoesNotExist"
+
 
 def test_sfn_create_execute(sfn):
     definition = json.dumps(
@@ -4326,4 +4445,3 @@ def test_sfn_jsonata_assign_reuses_input(sfn_sync):
         assert json.loads(resp["output"]) == "hello world"
     finally:
         sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
-

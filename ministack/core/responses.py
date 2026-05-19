@@ -164,6 +164,120 @@ class AccountScopedDict:
         return f"AccountScopedDict({dict(self.items())})"
 
 
+class AccountRegionScopedDict:
+    """A dict-like container that namespaces keys by account ID and region.
+
+    This mirrors ``AccountScopedDict`` while adding the current request region
+    to the internal key. It lets regional services keep their existing module
+    stores and dict operations while preventing same-name regional resources
+    from colliding or leaking across requests.
+    """
+
+    __slots__ = ("_data",)
+
+    def __init__(self):
+        self._data: dict = {}
+
+    # -- internal helpers --------------------------------------------------
+
+    def _scoped(self, key):
+        return (get_account_id(), get_region(), key)
+
+    def _unscope(self, scoped_key):
+        return scoped_key[2]
+
+    def _prefix(self):
+        return (get_account_id(), get_region())
+
+    def _is_mine(self, scoped_key):
+        return scoped_key[:2] == self._prefix()
+
+    # -- dict interface ----------------------------------------------------
+
+    def __setitem__(self, key, value):
+        self._data[self._scoped(key)] = value
+
+    def __getitem__(self, key):
+        return self._data[self._scoped(key)]
+
+    def __delitem__(self, key):
+        del self._data[self._scoped(key)]
+
+    def __contains__(self, key):
+        return self._scoped(key) in self._data
+
+    def __len__(self):
+        return sum(1 for k in self._data if self._is_mine(k))
+
+    def __bool__(self):
+        return any(self._is_mine(k) for k in self._data)
+
+    def __iter__(self):
+        for k in self._data:
+            if self._is_mine(k):
+                yield self._unscope(k)
+
+    def get(self, key, default=None):
+        return self._data.get(self._scoped(key), default)
+
+    def pop(self, key, *args):
+        return self._data.pop(self._scoped(key), *args)
+
+    def setdefault(self, key, default=None):
+        return self._data.setdefault(self._scoped(key), default)
+
+    def keys(self):
+        return [self._unscope(k) for k in self._data if self._is_mine(k)]
+
+    def values(self):
+        return [v for k, v in self._data.items() if self._is_mine(k)]
+
+    def items(self):
+        return [(self._unscope(k), v) for k, v in self._data.items() if self._is_mine(k)]
+
+    def all_values(self):
+        return list(self._data.values())
+
+    def all_items(self):
+        return list(self._data.items())
+
+    def update(self, other):
+        if isinstance(other, AccountRegionScopedDict):
+            self._data.update(other._data)
+        elif isinstance(other, AccountScopedDict):
+            region = get_region()
+            for (account_id, key), value in other._data.items():
+                self._data[(account_id, region, key)] = value
+        elif isinstance(other, dict):
+            region = get_region()
+            for k, v in other.items():
+                if isinstance(k, tuple) and len(k) == 3:
+                    self._data[k] = v
+                elif isinstance(k, tuple) and len(k) == 2:
+                    account_id, original_key = k
+                    self._data[(account_id, region, original_key)] = v
+                else:
+                    self[k] = v
+
+    def clear(self):
+        """Clear ALL accounts' and regions' data (used by reset)."""
+        self._data.clear()
+
+    def to_dict(self):
+        """Convert ALL accounts' and regions' data to a plain dict."""
+        return dict(self._data)
+
+    @classmethod
+    def from_dict(cls, data):
+        """Restore from a plain dict produced by to_dict()."""
+        obj = cls()
+        obj._data = dict(data)
+        return obj
+
+    def __repr__(self):
+        return f"AccountRegionScopedDict({dict(self.items())})"
+
+
 def xml_response(root_tag: str, namespace: str, children: dict, status: int = 200) -> tuple:
     """Build an AWS-style XML response."""
     root = Element(root_tag, xmlns=namespace)
