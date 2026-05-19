@@ -10,9 +10,11 @@ Since no real DB containers are available in CI, these tests focus on:
 import json
 import os
 import urllib.request
+import uuid
 
 import pytest
 from botocore.exceptions import ClientError
+from conftest import make_client
 
 ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
 REGION = "us-east-1"
@@ -42,6 +44,10 @@ def _raw_post(path, body):
         return resp.status, json.loads(resp.read())
     except urllib.error.HTTPError as e:
         return e.code, json.loads(e.read())
+
+
+def _regional_client(service, region):
+    return make_client(service, region_name=region)
 
 
 # ── Routing tests ──────────────────────────────────────────
@@ -295,6 +301,60 @@ def test_rds_data_stub_create_and_query_databases(rds, sm):
     assert status == 200
     names = [r[0]["stringValue"] for r in body.get("records", [])]
     assert "myappdb" in names
+
+
+def test_rds_data_resolves_cluster_arn_by_arn_region(rds, sm):
+    east_rds = _regional_client("rds", "us-east-1")
+    west_rds = _regional_client("rds", "us-west-2")
+    east_data = _regional_client("rds-data", "us-east-1")
+    cluster_id = f"rds-data-region-{uuid.uuid4().hex[:8]}"
+    secret_arn = sm.create_secret(
+        Name=f"rds-data-region-secret-{uuid.uuid4().hex[:8]}",
+        SecretString='{"username":"admin","password":"testpass123"}',
+    )["ARN"]
+
+    try:
+        east_rds.create_db_cluster(
+            DBClusterIdentifier=cluster_id,
+            Engine="aurora-mysql",
+            MasterUsername="admin",
+            MasterUserPassword="testpass123",
+        )
+        west_rds.create_db_cluster(
+            DBClusterIdentifier=cluster_id,
+            Engine="aurora-mysql",
+            MasterUsername="admin",
+            MasterUserPassword="testpass123",
+        )
+        east_arn = east_rds.describe_db_clusters(DBClusterIdentifier=cluster_id)["DBClusters"][0]["DBClusterArn"]
+        west_arn = west_rds.describe_db_clusters(DBClusterIdentifier=cluster_id)["DBClusters"][0]["DBClusterArn"]
+
+        east_data.execute_statement(
+            resourceArn=west_arn,
+            secretArn=secret_arn,
+            sql="CREATE DATABASE west_only_db",
+        )
+        east_resp = east_data.execute_statement(
+            resourceArn=east_arn,
+            secretArn=secret_arn,
+            sql="SHOW DATABASES",
+        )
+        west_resp = east_data.execute_statement(
+            resourceArn=west_arn,
+            secretArn=secret_arn,
+            sql="SHOW DATABASES",
+        )
+
+        east_names = [r[0]["stringValue"] for r in east_resp.get("records", [])]
+        west_names = [r[0]["stringValue"] for r in west_resp.get("records", [])]
+        assert "west_only_db" not in east_names
+        assert "west_only_db" in west_names
+    finally:
+        for client in (east_rds, west_rds):
+            try:
+                client.delete_db_cluster(DBClusterIdentifier=cluster_id, SkipFinalSnapshot=True)
+            except ClientError:
+                pass
 
 
 def test_rds_data_stub_create_and_query_users(rds, sm):

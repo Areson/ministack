@@ -232,6 +232,18 @@ class AccountRegionScopedDict:
     def get(self, key, default=None):
         return self._data.get(self._scoped(key), default)
 
+    def get_scoped(self, account_id, region, key, default=None):
+        return self._data.get((account_id, region, key), default)
+
+    def set_scoped(self, account_id, region, key, value):
+        self._data[(account_id, region, key)] = value
+
+    def contains_scoped(self, account_id, region, key):
+        return (account_id, region, key) in self._data
+
+    def pop_scoped(self, account_id, region, key, *args):
+        return self._data.pop((account_id, region, key), *args)
+
     def pop(self, key, *args):
         return self._data.pop(self._scoped(key), *args)
 
@@ -246,6 +258,12 @@ class AccountRegionScopedDict:
 
     def items(self):
         return [(self._unscope(k), v) for k, v in self._data.items() if self._is_mine(k)]
+
+    def values_scoped(self, account_id, region):
+        return [v for k, v in self._data.items() if k[:2] == (account_id, region)]
+
+    def items_scoped(self, account_id, region):
+        return [(self._unscope(k), v) for k, v in self._data.items() if k[:2] == (account_id, region)]
 
     def all_values(self):
         return list(self._data.values())

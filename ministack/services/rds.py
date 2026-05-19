@@ -41,8 +41,16 @@ import time
 from urllib.parse import parse_qs
 from xml.sax.saxutils import escape as _esc
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import load_state
-from ministack.core.responses import AccountScopedDict, apply_image_prefix, get_account_id, get_region, new_uuid
+from ministack.core.responses import (
+    AccountRegionScopedDict,
+    AccountScopedDict,
+    apply_image_prefix,
+    get_account_id,
+    get_region,
+    new_uuid,
+)
 
 logger = logging.getLogger("rds")
 
@@ -52,14 +60,14 @@ RDS_TMPFS_SIZE = os.environ.get("RDS_TMPFS_SIZE", "256m")
 RDS_PERSIST = os.environ.get("RDS_PERSIST", "0").lower() in ("1", "true", "yes")
 DOCKER_NETWORK = os.environ.get("DOCKER_NETWORK", "")
 
-_instances = AccountScopedDict()
-_clusters = AccountScopedDict()
-_subnet_groups = AccountScopedDict()
-_param_groups = AccountScopedDict()
-_snapshots = AccountScopedDict()
-_db_cluster_param_groups = AccountScopedDict()
-_db_cluster_snapshots = AccountScopedDict()
-_option_groups = AccountScopedDict()
+_instances = AccountRegionScopedDict()
+_clusters = AccountRegionScopedDict()
+_subnet_groups = AccountRegionScopedDict()
+_param_groups = AccountRegionScopedDict()
+_snapshots = AccountRegionScopedDict()
+_db_cluster_param_groups = AccountRegionScopedDict()
+_db_cluster_snapshots = AccountRegionScopedDict()
+_option_groups = AccountRegionScopedDict()
 _global_clusters = AccountScopedDict()
 _tags = AccountScopedDict()
 _port_counter = [BASE_PORT]
@@ -106,12 +114,19 @@ def restore_state(data):
     if "port_counter" in data:
         _port_counter[0] = data["port_counter"]
     instances_data = data.get("instances", {})
-    if isinstance(instances_data, AccountScopedDict):
-        # New format: AccountScopedDict with full multi-account data
+    if isinstance(instances_data, AccountRegionScopedDict):
         for key, inst in list(instances_data._data.items()):
             inst["_docker_container_id"] = None
             inst["DBInstanceStatus"] = "available"
             _instances._data[key] = inst
+    elif isinstance(instances_data, AccountScopedDict):
+        # Legacy account-scoped format: adopt into the default/current region.
+        region = get_region()
+        for key, inst in list(instances_data._data.items()):
+            account_id, instance_id = key
+            inst["_docker_container_id"] = None
+            inst["DBInstanceStatus"] = "available"
+            _instances._data[(account_id, region, instance_id)] = inst
     else:
         # Legacy format: plain dict keyed by instance name
         for name, inst in instances_data.items():
@@ -272,16 +287,55 @@ async def handle_request(method, path, headers, body, query_params):
 # Instance resolution helpers
 # ---------------------------------------------------------------------------
 
+def _parse_rds_arn(value):
+    try:
+        spec = parse_arn(value)
+    except ArnParseError:
+        return None
+    if spec.service != "rds":
+        return None
+    resource_type, sep, resource_id = spec.resource.partition(":")
+    if not sep or not resource_type or not resource_id:
+        return None
+    return spec, resource_type, resource_id
+
+
+def _regional_get(store, identifier, resource_type):
+    parsed = _parse_rds_arn(identifier)
+    if parsed:
+        spec, parsed_type, resource_id = parsed
+        if parsed_type != resource_type:
+            return None
+        return store.get_scoped(spec.account_id, spec.region, resource_id)
+    return store.get(identifier)
+
+
+def _resolve_cluster(cluster_id):
+    """Look up a DB cluster by identifier in the request region or by ARN region."""
+    return _regional_get(_clusters, cluster_id, "cluster")
+
+
+def _instances_for_cluster(cluster):
+    parsed = _parse_rds_arn(cluster.get("DBClusterArn", ""))
+    if parsed:
+        spec, _resource_type, cluster_id = parsed
+        instances = _instances.values_scoped(spec.account_id, spec.region)
+    else:
+        cluster_id = cluster.get("DBClusterIdentifier")
+        instances = _instances.values()
+    return [inst for inst in instances if inst.get("DBClusterIdentifier") == cluster_id]
+
+
 def _resolve_instance(db_id):
     """Look up an instance by DBInstanceIdentifier or DbiResourceId.
 
     AWS accepts either value for the DBInstanceIdentifier parameter in
     DescribeDBInstances and related APIs.
     """
-    inst = _instances.get(db_id)
+    inst = _regional_get(_instances, db_id, "db")
     if inst:
         return inst
-    if db_id.startswith("db-"):
+    if isinstance(db_id, str) and db_id.startswith("db-"):
         for inst in _instances.values():
             if inst.get("DbiResourceId") == db_id:
                 return inst
@@ -293,7 +347,7 @@ def _register_instance_in_cluster(instance):
     cid = instance.get("DBClusterIdentifier")
     if not cid:
         return
-    cluster = _clusters.get(cid)
+    cluster = _resolve_cluster(cid)
     if not cluster:
         return
     members = cluster.setdefault("DBClusterMembers", [])
@@ -336,8 +390,9 @@ def _create_db_instance(p):
 
     # Inherit credentials from cluster when instance is a cluster member.
     cluster_id_param = _p(p, "DBClusterIdentifier")
-    if cluster_id_param and cluster_id_param in _clusters:
-        parent = _clusters[cluster_id_param]
+    parent = _resolve_cluster(cluster_id_param) if cluster_id_param else None
+    if parent:
+        cluster_id_param = parent["DBClusterIdentifier"]
         if not _p(p, "MasterUsername"):
             master_user = parent.get("MasterUsername", master_user)
         if not _p(p, "MasterUserPassword"):
@@ -372,8 +427,13 @@ def _create_db_instance(p):
                     image=image, detach=True,
                     environment=env,
                     ports={f"{container_port}/tcp": host_port},
-                    name=f"ministack-rds-{db_id}",
-                    labels={"ministack": "rds", "db_id": db_id},
+                    name=_docker_name(db_id),
+                    labels={
+                        "ministack": "rds",
+                        "db_id": db_id,
+                        "account_id": get_account_id(),
+                        "region": get_region(),
+                    },
                 )
                 if ms_network:
                     container_kwargs["network"] = ms_network
@@ -383,7 +443,7 @@ def _create_db_instance(p):
                 # layout change (where the path differs from earlier majors).
                 if RDS_PERSIST:
                     container_kwargs["volumes"] = {
-                        f"ministack-rds-{db_id}-data": {"bind": data_path, "mode": "rw"},
+                        f"{_docker_name(db_id)}-data": {"bind": data_path, "mode": "rw"},
                     }
                 else:
                     container_kwargs["tmpfs"] = {
@@ -429,7 +489,7 @@ def _create_db_instance(p):
             except Exception as e:
                 logger.warning("RDS: Docker failed for %s: %s", db_id, e)
 
-    cluster_id = _p(p, "DBClusterIdentifier")
+    cluster_id = cluster_id_param
     param_group_name = _p(p, "DBParameterGroupName") or f"default.{engine}{engine_version.split('.')[0]}"
     now_ts = time.time()
 
@@ -548,8 +608,9 @@ def _delete_db_instance(p):
     instance = _resolve_instance(db_id)
     if not instance:
         return _error("DBInstanceNotFound", f"DBInstance {db_id} not found.", 404)
+    instance_id = instance["DBInstanceIdentifier"]
 
-    _unregister_instance_from_clusters(db_id)
+    _unregister_instance_from_clusters(instance_id)
 
     if instance.get("DeletionProtection"):
         return _error("InvalidParameterCombination",
@@ -561,9 +622,9 @@ def _delete_db_instance(p):
             c = docker_client.containers.get(instance["_docker_container_id"])
             c.stop(timeout=5)
             c.remove(v=True)
-            logger.info("RDS: removed container for %s", db_id)
+            logger.info("RDS: removed container for %s", instance_id)
         except Exception as e:
-            logger.warning("RDS: failed to remove container for %s: %s", db_id, e)
+            logger.warning("RDS: failed to remove container for %s: %s", instance_id, e)
 
     skip_snapshot = _p(p, "SkipFinalSnapshot") == "true"
     final_snap_id = _p(p, "FinalDBSnapshotIdentifier")
@@ -573,7 +634,7 @@ def _delete_db_instance(p):
     instance["DBInstanceStatus"] = "deleting"
     arn = instance["DBInstanceArn"]
     _tags.pop(arn, None)
-    del _instances[db_id]
+    del _instances[instance_id]
     return _single_instance_response("DeleteDBInstanceResponse", "DeleteDBInstanceResult", instance)
 
 
@@ -949,7 +1010,7 @@ def _create_db_cluster(p):
 
 def _delete_db_cluster(p):
     cluster_id = _p(p, "DBClusterIdentifier")
-    cluster = _clusters.get(cluster_id)
+    cluster = _resolve_cluster(cluster_id)
     if not cluster:
         return _error("DBClusterNotFoundFault", f"DBCluster {cluster_id} not found.", 404)
 
@@ -964,7 +1025,7 @@ def _delete_db_cluster(p):
 
     cluster["Status"] = "deleting"
     _tags.pop(cluster["DBClusterArn"], None)
-    del _clusters[cluster_id]
+    del _clusters[cluster["DBClusterIdentifier"]]
     return _xml(200, "DeleteDBClusterResponse",
         f"<DeleteDBClusterResult><DBCluster>{_cluster_xml(cluster)}</DBCluster></DeleteDBClusterResult>")
 
@@ -972,7 +1033,7 @@ def _delete_db_cluster(p):
 def _describe_db_clusters(p):
     cluster_id = _p(p, "DBClusterIdentifier")
     if cluster_id:
-        cluster = _clusters.get(cluster_id)
+        cluster = _resolve_cluster(cluster_id)
         if not cluster:
             return _error("DBClusterNotFoundFault", f"DBCluster {cluster_id} not found.", 404)
         clusters = [cluster]
@@ -990,9 +1051,7 @@ def _describe_db_clusters(p):
 def _rotate_real_password(cluster, old_pass, new_pass):
     """Alter the root password on the real MySQL/MariaDB container."""
     cluster_id = cluster.get("DBClusterIdentifier", "")
-    for inst in _instances.values():
-        if inst.get("DBClusterIdentifier") != cluster_id:
-            continue
+    for inst in _instances_for_cluster(cluster):
         engine = inst.get("Engine", "")
         if not any(e in engine for e in ("mysql", "aurora-mysql", "mariadb")):
             continue
@@ -1023,7 +1082,7 @@ def _rotate_real_password(cluster, old_pass, new_pass):
 
 def _modify_db_cluster(p):
     cluster_id = _p(p, "DBClusterIdentifier")
-    cluster = _clusters.get(cluster_id)
+    cluster = _resolve_cluster(cluster_id)
     if not cluster:
         return _error("DBClusterNotFoundFault", f"DBCluster {cluster_id} not found.", 404)
 
@@ -1560,7 +1619,7 @@ def _create_db_cluster_snapshot(p):
         return _error("DBClusterSnapshotAlreadyExistsFault",
             f"DB cluster snapshot {snap_id} already exists.", 400)
 
-    cluster = _clusters.get(cluster_id)
+    cluster = _resolve_cluster(cluster_id)
     if not cluster:
         return _error("DBClusterNotFoundFault", f"DBCluster {cluster_id} not found.", 404)
 
@@ -1666,7 +1725,7 @@ def _modify_subnet_group(p):
 
 def _start_db_cluster(p):
     cluster_id = _p(p, "DBClusterIdentifier")
-    cluster = _clusters.get(cluster_id)
+    cluster = _resolve_cluster(cluster_id)
     if not cluster:
         return _error("DBClusterNotFoundFault", f"DBCluster {cluster_id} not found.", 404)
     cluster["Status"] = "available"
@@ -1676,7 +1735,7 @@ def _start_db_cluster(p):
 
 def _stop_db_cluster(p):
     cluster_id = _p(p, "DBClusterIdentifier")
-    cluster = _clusters.get(cluster_id)
+    cluster = _resolve_cluster(cluster_id)
     if not cluster:
         return _error("DBClusterNotFoundFault", f"DBCluster {cluster_id} not found.", 404)
     cluster["Status"] = "stopped"
@@ -1822,15 +1881,15 @@ def _list_tags(p):
 def _sync_tag_list_to_resource(arn):
     """Keep the embedded TagList on instances/clusters in sync with _tags."""
     tag_list = _tags.get(arn, [])
-    for inst in _instances.values():
+    for inst in _instances.all_values():
         if inst.get("DBInstanceArn") == arn:
             inst["TagList"] = list(tag_list)
             return
-    for cl in _clusters.values():
+    for cl in _clusters.all_values():
         if cl.get("DBClusterArn") == arn:
             cl["TagList"] = list(tag_list)
             return
-    for snap in _snapshots.values():
+    for snap in _snapshots.all_values():
         if snap.get("DBSnapshotArn") == arn:
             snap["TagList"] = list(tag_list)
             return
@@ -1866,12 +1925,11 @@ def _create_global_cluster(p):
     members = []
     if source_cluster_id:
         source_arn = source_cluster_id
-        for cl in _clusters.values():
-            if cl["DBClusterIdentifier"] == source_cluster_id or cl["DBClusterArn"] == source_cluster_id:
-                source_arn = cl["DBClusterArn"]
-                engine = cl["Engine"]
-                engine_version = cl["EngineVersion"]
-                break
+        cl = _resolve_cluster(source_cluster_id)
+        if cl:
+            source_arn = cl["DBClusterArn"]
+            engine = cl["Engine"]
+            engine_version = cl["EngineVersion"]
         members.append({
             "DBClusterArn": source_arn,
             "IsWriter": True,
@@ -1946,10 +2004,9 @@ def _remove_from_global_cluster(p):
     members = gc.get("GlobalClusterMembers", [])
     new_members = [m for m in members if m["DBClusterArn"] != db_cluster_id]
     if len(new_members) == len(members):
-        for cl in _clusters.values():
-            if cl["DBClusterIdentifier"] == db_cluster_id:
-                db_cluster_id = cl["DBClusterArn"]
-                break
+        cl = _resolve_cluster(db_cluster_id)
+        if cl:
+            db_cluster_id = cl["DBClusterArn"]
         new_members = [m for m in members if m["DBClusterArn"] != db_cluster_id]
 
     gc["GlobalClusterMembers"] = new_members
@@ -1985,14 +2042,14 @@ def _modify_global_cluster(p):
 
 def _enable_http_endpoint(p):
     arn = _p(p, "ResourceArn")
-    for cluster in _clusters.values():
-        if cluster.get("DBClusterArn") == arn:
-            cluster["HttpEndpointEnabled"] = True
-            return _xml(200, "EnableHttpEndpointResponse",
-                f"<EnableHttpEndpointResult>"
-                f"<ResourceArn>{arn}</ResourceArn>"
-                f"<HttpEndpointEnabled>true</HttpEndpointEnabled>"
-                f"</EnableHttpEndpointResult>")
+    cluster = _resolve_cluster(arn)
+    if cluster:
+        cluster["HttpEndpointEnabled"] = True
+        return _xml(200, "EnableHttpEndpointResponse",
+            f"<EnableHttpEndpointResult>"
+            f"<ResourceArn>{arn}</ResourceArn>"
+            f"<HttpEndpointEnabled>true</HttpEndpointEnabled>"
+            f"</EnableHttpEndpointResult>")
     return _error("DBClusterNotFoundFault", f"Cluster with ARN {arn} not found.", 404)
 
 
@@ -2579,6 +2636,10 @@ def _license_model(engine):
     return "general-public-license"
 
 
+def _docker_name(db_id):
+    return f"ministack-rds-{get_account_id()}-{get_region()}-{db_id}"
+
+
 def _docker_image_for_engine(engine, engine_version, user, password, db_name):
     """Return (image, env_dict, container_port, data_path) or all-None.
 
@@ -2745,7 +2806,7 @@ _ACTION_MAP = {
 def reset():
     docker_client = _get_docker()
     if docker_client:
-        for instance in _instances.values():
+        for instance in _instances.all_values():
             cid = instance.get("_docker_container_id")
             if cid:
                 try:
