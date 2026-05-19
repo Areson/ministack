@@ -38,6 +38,7 @@ from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import wait as futures_wait
 from datetime import datetime, timezone
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
@@ -2778,6 +2779,14 @@ def _extract_lambda_name(resource):
     if not resource:
         return None
     if ":function:" in resource:
+        try:
+            spec = parse_arn(resource)
+        except ArnParseError:
+            return resource.split(":function:")[-1].split(":")[0]
+        if spec.service == "lambda":
+            parts = spec.resource.split(":", 2)
+            if len(parts) >= 2 and parts[0] == "function":
+                return parts[1]
         return resource.split(":function:")[-1].split(":")[0]
     return None
 

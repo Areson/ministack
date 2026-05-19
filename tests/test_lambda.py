@@ -3585,6 +3585,16 @@ def test_account_from_arn_lambda_runtime_helper_matches():
         assert runtime_helper("arn:aws:lambda") == "fallback_key"
 
 
+def test_lambda_resolve_name_and_qualifier_uses_resource_tail():
+    """Qualified Lambda ARNs keep the function resource tail intact."""
+    from ministack.services.lambda_svc import _resolve_name, _resolve_name_and_qualifier
+
+    arn = "arn:aws:lambda:us-east-1:123456789012:function:my-func:live"
+
+    assert _resolve_name(arn) == "my-func"
+    assert _resolve_name_and_qualifier(arn) == ("my-func", "live")
+
+
 def _run_nodejs_worker(handler_js, event_payload=None, env_extra=None):
     """Spin up a Node.js Lambda worker with the given handler, return invoke result."""
     import io

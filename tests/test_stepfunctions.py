@@ -2050,6 +2050,15 @@ def test_sfn_integration_lambda_invoke(sfn, lam):
     output = json.loads(desc["output"])
     assert output["result"]["doubled"] == 42
 
+
+def test_sfn_extract_lambda_name_uses_resource_tail():
+    from ministack.services.stepfunctions import _extract_lambda_name
+
+    arn = "arn:aws:lambda:us-east-1:123456789012:function:my-func:live"
+
+    assert _extract_lambda_name(arn) == "my-func"
+
+
 def test_sfn_choice_state(sfn):
     """Choice state routes to correct branch based on input."""
     definition = json.dumps(

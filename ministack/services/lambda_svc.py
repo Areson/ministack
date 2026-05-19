@@ -47,6 +47,7 @@ from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import unquote
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.lambda_runtime import get_or_create_worker, invalidate_worker
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
@@ -100,10 +101,10 @@ def _account_from_arn(arn: str) -> str:
 
     Falls back to the host's AWS_ACCESS_KEY_ID if the ARN is malformed."""
     try:
-        parts = arn.split(":")
-        if len(parts) >= 5 and _12_DIGIT_RE.match(parts[4]):
-            return parts[4]
-    except (AttributeError, TypeError):
+        account_id = parse_arn(arn).account_id
+        if _12_DIGIT_RE.match(account_id):
+            return account_id
+    except ArnParseError:
         pass
     return os.environ.get("AWS_ACCESS_KEY_ID", "test")
 
@@ -444,8 +445,8 @@ def _resolve_name(name_or_arn: str) -> str:
     if not name_or_arn:
         return ""
     if name_or_arn.startswith("arn:"):
-        segs = name_or_arn.split(":")
-        return segs[6] if len(segs) >= 7 else name_or_arn
+        name, _qualifier = _lambda_function_name_and_qualifier_from_arn(name_or_arn)
+        return name or name_or_arn
     if ":" in name_or_arn:
         return name_or_arn.split(":")[0]
     return name_or_arn
@@ -463,14 +464,26 @@ def _resolve_name_and_qualifier(name_or_arn: str) -> tuple[str, str | None]:
     if not name_or_arn:
         return "", None
     if name_or_arn.startswith("arn:"):
-        segs = name_or_arn.split(":")
-        name = segs[6] if len(segs) >= 7 else name_or_arn
-        qualifier = segs[7] if len(segs) >= 8 and segs[7] else None
-        return name, qualifier
+        name, qualifier = _lambda_function_name_and_qualifier_from_arn(name_or_arn)
+        return (name, qualifier) if name else (name_or_arn, None)
     if ":" in name_or_arn:
         name, qualifier = name_or_arn.split(":", 1)
         return name, qualifier or None
     return name_or_arn, None
+
+
+def _lambda_function_name_and_qualifier_from_arn(value: str) -> tuple[str, str | None]:
+    try:
+        spec = parse_arn(value)
+    except ArnParseError:
+        return "", None
+    if spec.service != "lambda":
+        return "", None
+    parts = spec.resource.split(":", 2)
+    if len(parts) < 2 or parts[0] != "function" or not parts[1]:
+        return "", None
+    qualifier = parts[2] if len(parts) == 3 and parts[2] else None
+    return parts[1], qualifier
 
 
 def _func_arn(name: str) -> str:

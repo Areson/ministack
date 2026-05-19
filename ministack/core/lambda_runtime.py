@@ -17,6 +17,7 @@ import threading
 import time
 import zipfile
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import _12_DIGIT_RE
 
 logger = logging.getLogger("lambda_runtime")
@@ -27,10 +28,10 @@ def _account_from_arn(arn: str) -> str:
     Falls back to the host's AWS_ACCESS_KEY_ID if the ARN is malformed.
     Defined locally to avoid circular imports with lambda_svc."""
     try:
-        parts = arn.split(":")
-        if len(parts) >= 5 and _12_DIGIT_RE.match(parts[4]):
-            return parts[4]
-    except (AttributeError, TypeError):
+        account_id = parse_arn(arn).account_id
+        if _12_DIGIT_RE.match(account_id):
+            return account_id
+    except ArnParseError:
         pass
     return os.environ.get("AWS_ACCESS_KEY_ID", "test")
 
@@ -38,10 +39,10 @@ def _account_from_arn(arn: str) -> str:
 def _region_from_arn(arn: str) -> str:
     """Extract the region from a Lambda function ARN."""
     try:
-        parts = arn.split(":")
-        if len(parts) >= 4 and parts[3]:
-            return parts[3]
-    except (AttributeError, TypeError):
+        region = parse_arn(arn).region
+        if region:
+            return region
+    except ArnParseError:
         pass
     return os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
 
