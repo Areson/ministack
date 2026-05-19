@@ -9,6 +9,37 @@ def _regional_rds(region):
     return make_client("rds", region_name=region)
 
 
+def _delete_cluster(client, cluster_id):
+    try:
+        client.delete_db_cluster(DBClusterIdentifier=cluster_id, SkipFinalSnapshot=True)
+    except ClientError:
+        pass
+
+
+def _remove_global_member(client, global_id, cluster_id):
+    try:
+        client.remove_from_global_cluster(
+            GlobalClusterIdentifier=global_id,
+            DbClusterIdentifier=cluster_id,
+        )
+    except ClientError:
+        pass
+
+
+def _delete_global_cluster(client, global_id):
+    try:
+        client.modify_global_cluster(
+            GlobalClusterIdentifier=global_id,
+            DeletionProtection=False,
+        )
+    except ClientError:
+        pass
+    try:
+        client.delete_global_cluster(GlobalClusterIdentifier=global_id)
+    except ClientError:
+        pass
+
+
 def test_rds_clusters_are_region_scoped():
     east = _regional_rds("us-east-1")
     west = _regional_rds("us-west-2")
@@ -54,10 +85,7 @@ def test_rds_clusters_are_region_scoped():
             (east, shared),
             (west, shared),
         ):
-            try:
-                client.delete_db_cluster(DBClusterIdentifier=cluster_id, SkipFinalSnapshot=True)
-            except ClientError:
-                pass
+            _delete_cluster(client, cluster_id)
 
 
 def test_rds_instances_are_region_scoped():
@@ -96,3 +124,97 @@ def test_rds_instances_are_region_scoped():
                 client.delete_db_instance(DBInstanceIdentifier=shared, SkipFinalSnapshot=True)
             except ClientError:
                 pass
+
+
+def test_aurora_global_metadata_spans_regions():
+    east = _regional_rds("us-east-1")
+    west = _regional_rds("us-west-2")
+    suffix = uuid.uuid4().hex[:8]
+    primary_id = f"global-primary-{suffix}"
+    secondary_id = f"global-secondary-{suffix}"
+    global_id = f"global-metadata-{suffix}"
+
+    try:
+        primary = east.create_db_cluster(
+            DBClusterIdentifier=primary_id,
+            Engine="aurora-mysql",
+            MasterUsername="admin",
+            MasterUserPassword="password123",
+        )["DBCluster"]
+        east.create_global_cluster(
+            GlobalClusterIdentifier=global_id,
+            SourceDBClusterIdentifier=primary["DBClusterArn"],
+            DeletionProtection=True,
+        )
+
+        primary_after_attach = east.describe_db_clusters(DBClusterIdentifier=primary_id)["DBClusters"][0]
+        assert primary_after_attach["GlobalClusterIdentifier"] == global_id
+
+        west.create_db_cluster(
+            DBClusterIdentifier=secondary_id,
+            Engine="aurora-mysql",
+            GlobalClusterIdentifier=global_id,
+            KmsKeyId="alias/aws/rds",
+            MasterUsername="admin",
+            MasterUserPassword="password123",
+        )
+        secondary = west.describe_db_clusters(DBClusterIdentifier=secondary_id)["DBClusters"][0]
+        assert secondary["GlobalClusterIdentifier"] == global_id
+        assert secondary["KmsKeyId"] == "alias/aws/rds"
+
+        east_global = east.describe_global_clusters(GlobalClusterIdentifier=global_id)["GlobalClusters"][0]
+        west_global = west.describe_global_clusters(GlobalClusterIdentifier=global_id)["GlobalClusters"][0]
+        assert east_global == west_global
+        assert east_global["DeletionProtection"] is True
+
+        members = east_global["GlobalClusterMembers"]
+        by_arn = {m["DBClusterArn"]: m for m in members}
+        assert set(by_arn) == {primary["DBClusterArn"], secondary["DBClusterArn"]}
+        assert by_arn[primary["DBClusterArn"]]["IsWriter"] is True
+        assert by_arn[secondary["DBClusterArn"]]["IsWriter"] is False
+        assert by_arn[secondary["DBClusterArn"]]["SynchronizationStatus"] == "connected"
+        assert by_arn[secondary["DBClusterArn"]]["GlobalWriteForwardingStatus"] == "disabled"
+
+        with pytest.raises(ClientError) as exc:
+            west.delete_db_cluster(DBClusterIdentifier=secondary_id, SkipFinalSnapshot=True)
+        assert exc.value.response["Error"]["Code"] == "InvalidDBClusterStateFault"
+
+        east.modify_global_cluster(GlobalClusterIdentifier=global_id, DeletionProtection=False)
+        east.modify_db_cluster(DBClusterIdentifier=primary_id, DeletionProtection=True)
+        assert east.describe_db_clusters(DBClusterIdentifier=primary_id)["DBClusters"][0]["DeletionProtection"] is True
+        east.modify_db_cluster(DBClusterIdentifier=primary_id, DeletionProtection=False)
+
+        with pytest.raises(ClientError) as exc:
+            east.delete_global_cluster(GlobalClusterIdentifier=global_id)
+        assert exc.value.response["Error"]["Code"] == "InvalidGlobalClusterStateFault"
+
+        west.remove_from_global_cluster(
+            GlobalClusterIdentifier=global_id,
+            DbClusterIdentifier=secondary["DBClusterArn"],
+        )
+        secondary_after_detach = west.describe_db_clusters(DBClusterIdentifier=secondary_id)["DBClusters"][0]
+        assert "GlobalClusterIdentifier" not in secondary_after_detach
+        assert len(east.describe_global_clusters(GlobalClusterIdentifier=global_id)["GlobalClusters"][0]["GlobalClusterMembers"]) == 1
+        west.delete_db_cluster(DBClusterIdentifier=secondary_id, SkipFinalSnapshot=True)
+
+        east.remove_from_global_cluster(
+            GlobalClusterIdentifier=global_id,
+            DbClusterIdentifier=primary["DBClusterArn"],
+        )
+        assert east.describe_global_clusters(GlobalClusterIdentifier=global_id)["GlobalClusters"][0]["GlobalClusterMembers"] == []
+        east.delete_global_cluster(GlobalClusterIdentifier=global_id)
+        east.delete_db_cluster(DBClusterIdentifier=primary_id, SkipFinalSnapshot=True)
+    finally:
+        _remove_global_member(west, global_id, secondary_id)
+        _remove_global_member(east, global_id, primary_id)
+        _delete_global_cluster(east, global_id)
+        _delete_cluster(west, secondary_id)
+        _delete_cluster(east, primary_id)
+
+
+def test_aurora_engine_versions_advertise_global_database_support():
+    rds = _regional_rds("us-east-1")
+
+    resp = rds.describe_db_engine_versions(Engine="aurora-mysql")
+    assert resp["DBEngineVersions"]
+    assert all(v["SupportsGlobalDatabases"] is True for v in resp["DBEngineVersions"])

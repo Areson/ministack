@@ -1392,9 +1392,43 @@ def test_sfn_aws_sdk_rds_not_found_error(sfn, sfn_sync):
 
     resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input=json.dumps({}))
     assert resp["status"] == "FAILED"
-    assert "DBClusterNotFoundFault" in (resp.get("error", "") + resp.get("cause", ""))
+    assert resp.get("error") == "Rds.DbClusterNotFoundException"
 
     sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
+def test_sfn_aws_sdk_rds_global_not_found_error_uses_aws_name(sfn, sfn_sync):
+    """RDS SDK integrations normalize raw global-cluster faults to SFN's error name."""
+    import uuid as _uuid
+
+    sm_name = f"sdk-rds-global-notfound-{_uuid.uuid4().hex[:8]}"
+
+    definition = json.dumps({
+        "StartAt": "DescribeMissing",
+        "States": {
+            "DescribeMissing": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:rds:DescribeGlobalClusters",
+                "Parameters": {
+                    "GlobalClusterIdentifier": "this-global-cluster-does-not-exist",
+                },
+                "End": True,
+            },
+        },
+    })
+
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+    )["stateMachineArn"]
+
+    resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input=json.dumps({}))
+    assert resp["status"] == "FAILED"
+    assert resp.get("error") == "Rds.GlobalClusterNotFoundException"
+
+    sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
 
 def test_sfn_start_sync_execution(sfn_sync):
     import uuid as _uuid
