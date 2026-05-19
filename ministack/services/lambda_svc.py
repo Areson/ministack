@@ -26,6 +26,7 @@ SQS event source mappings poll the queue in a background thread.
 
 import asyncio
 import base64
+import contextvars
 import copy
 import hashlib
 import importlib
@@ -50,8 +51,10 @@ from ministack.core.lambda_runtime import get_or_create_worker, invalidate_worke
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
     _12_DIGIT_RE,
+    AccountRegionScopedDict,
     AccountScopedDict,
     _request_account_id,
+    _request_region,
     apply_image_prefix,
     error_response_json,
     get_account_id,
@@ -187,10 +190,10 @@ def _get_docker_client():
     except Exception:
         return None
 
-_functions = AccountScopedDict()  # function_name -> FunctionRecord
-_layers = AccountScopedDict()  # layer_name -> {"versions": [...], "next_version": int}
-_esms = AccountScopedDict()  # uuid -> esm dict
-_function_urls = AccountScopedDict()  # function_name -> FunctionUrlConfig dict
+_functions = AccountRegionScopedDict()  # function_name -> FunctionRecord
+_layers = AccountRegionScopedDict()  # layer_name -> {"versions": [...], "next_version": int}
+_esms = AccountRegionScopedDict()  # uuid -> esm dict
+_function_urls = AccountRegionScopedDict()  # function_name -> FunctionUrlConfig dict
 _poller_started = False
 _poller_lock = threading.Lock()
 
@@ -199,9 +202,9 @@ _poller_lock = threading.Lock()
 
 def get_state():
     """Return JSON-serializable state. code_zip bytes are base64-encoded."""
-    from ministack.core.responses import AccountScopedDict
-    funcs = AccountScopedDict()
-    # Iterate _data directly to capture ALL accounts, not just current request context
+    funcs = AccountRegionScopedDict()
+    # Iterate _data directly to capture ALL accounts and regions, not just
+    # current request context.
     for scoped_key, func in _functions._data.items():
         f = copy.deepcopy(func)
         if f.get("code_zip") and isinstance(f["code_zip"], bytes):
@@ -226,9 +229,8 @@ def get_state():
 
 def restore_state(data):
     if data:
-        from ministack.core.responses import AccountScopedDict
         funcs = data.get("functions", {})
-        if isinstance(funcs, AccountScopedDict):
+        if isinstance(funcs, AccountRegionScopedDict):
             for scoped_key, func in funcs._data.items():
                 if func.get("code_zip") and isinstance(func["code_zip"], str):
                     func["code_zip"] = base64.b64decode(func["code_zip"])
@@ -236,6 +238,15 @@ def restore_state(data):
                     if ver.get("code_zip") and isinstance(ver["code_zip"], str):
                         ver["code_zip"] = base64.b64decode(ver["code_zip"])
                 _functions._data[scoped_key] = func
+        elif isinstance(funcs, AccountScopedDict):
+            region = get_region()
+            for (account_id, name), func in funcs._data.items():
+                if func.get("code_zip") and isinstance(func["code_zip"], str):
+                    func["code_zip"] = base64.b64decode(func["code_zip"])
+                for ver in func.get("versions", {}).values():
+                    if ver.get("code_zip") and isinstance(ver["code_zip"], str):
+                        ver["code_zip"] = base64.b64decode(ver["code_zip"])
+                _functions._data[(account_id, region, name)] = func
         else:
             for name, func in funcs.items():
                 if func.get("code_zip") and isinstance(func["code_zip"], str):
@@ -1266,7 +1277,7 @@ def _delete_function(name: str, query_params: dict):
         _functions[name]["versions"].pop(qualifier, None)
     else:
         del _functions[name]
-        invalidate_worker(name)
+        invalidate_worker(name, account=get_account_id(), region=get_region())
     return 204, {}, b""
 
 
@@ -1318,7 +1329,7 @@ def _update_code(name: str, data: dict):
     func["config"]["RevisionId"] = new_uuid()
 
     # Invalidate only the old $LATEST worker — published version workers stay alive
-    invalidate_worker(name, qualifier="$LATEST")
+    invalidate_worker(name, qualifier="$LATEST", account=get_account_id(), region=get_region())
     _schedule_state_transition(name, _LAMBDA_STATE_TRANSITION_DELAY)
 
     if data.get("Publish"):
@@ -1584,10 +1595,13 @@ _reaper_lock = threading.Lock()
 
 
 def _warm_pool_key(func_name: str, config: dict) -> str:
-    acct = get_account_id()
+    arn = config.get("FunctionArn", "")
+    parts = arn.split(":")
+    acct = parts[4] if len(parts) > 4 and parts[4] else get_account_id()
+    region = parts[3] if len(parts) > 3 and parts[3] else get_region()
     if config.get("PackageType") == "Image":
-        return f"{acct}:{func_name}:image:{config.get('ImageUri', '')}"
-    return f"{acct}:{func_name}:zip:{config.get('CodeSha256', 'nosha')}"
+        return f"{acct}:{region}:{func_name}:image:{config.get('ImageUri', '')}"
+    return f"{acct}:{region}:{func_name}:zip:{config.get('CodeSha256', 'nosha')}"
 
 
 def _is_container_running(container) -> bool:
@@ -1739,27 +1753,24 @@ _LAMBDA_STATE_TRANSITION_DELAY = float(os.environ.get("LAMBDA_STATE_TRANSITION_S
 
 def _schedule_state_transition(func_name: str, delay: float) -> None:
     """Flip State and LastUpdateStatus to the post-ready values after `delay`."""
-    acct = get_account_id()
-
     def _flip():
         time.sleep(delay)
-        # Re-fetch under the correct account context so multi-tenant cases work.
-        token = _request_account_id.set(acct)
-        try:
-            fn = _functions.get(func_name)
-            if not fn:
-                return
-            cfg = fn.get("config", {})
-            cfg["State"] = "Active"
-            cfg["StateReason"] = ""
-            cfg["StateReasonCode"] = ""
-            cfg["LastUpdateStatus"] = "Successful"
-            cfg["LastUpdateStatusReason"] = ""
-            cfg["LastUpdateStatusReasonCode"] = ""
-        finally:
-            _request_account_id.reset(token)
+        # Re-fetch under the request's account and region context so
+        # multi-tenant, multi-region cases update the function that was just
+        # created or modified.
+        fn = _functions.get(func_name)
+        if not fn:
+            return
+        cfg = fn.get("config", {})
+        cfg["State"] = "Active"
+        cfg["StateReason"] = ""
+        cfg["StateReasonCode"] = ""
+        cfg["LastUpdateStatus"] = "Successful"
+        cfg["LastUpdateStatusReason"] = ""
+        cfg["LastUpdateStatusReasonCode"] = ""
 
-    threading.Thread(target=_flip, daemon=True).start()
+    ctx_snapshot = contextvars.copy_context()
+    threading.Thread(target=ctx_snapshot.run, args=(_flip,), daemon=True).start()
 
 
 # AWS-match: real Lambda async retry spacing is exponential backoff
@@ -2770,7 +2781,7 @@ def _execute_function_warm(func: dict, event: dict) -> dict:
             }
     except Exception as e:
         logger.error("Warm worker execution error for %s: %s", func_name, e)
-        invalidate_worker(func_name, qualifier=qualifier)
+        invalidate_worker(func_name, qualifier=qualifier, account=get_account_id(), region=get_region())
         return {
             "body": {"errorMessage": str(e), "errorType": type(e).__name__},
             "error": True,
@@ -4134,9 +4145,9 @@ def _delete_esm(esm_id: str):
 # ---------------------------------------------------------------------------
 
 # Per-ESM Kinesis iterator tracking: esm_uuid -> {shard_id: position}
-_kinesis_positions = AccountScopedDict()
+_kinesis_positions = AccountRegionScopedDict()
 # Per-ESM DynamoDB stream tracking: esm_uuid -> {shard_id: position}
-_dynamodb_stream_positions = AccountScopedDict()
+_dynamodb_stream_positions = AccountRegionScopedDict()
 _dynamodb_stream_positions_lock = threading.Lock()
 
 
@@ -4167,122 +4178,138 @@ def _poll_loop():
         time.sleep(1 if _esms else 5)
 
 
+def _iter_all_esms():
+    for scoped_key, esm in list(_esms._data.items()):
+        if len(scoped_key) == 3:
+            acct_id, region, _esm_key = scoped_key
+        else:
+            acct_id, _esm_key = scoped_key
+            region = REGION
+        yield acct_id, region, esm
+
+
 def _poll_sqs():
     from ministack.services import sqs as _sqs
 
-    for (acct_id, _esm_key), esm in list(_esms._data.items()):
-        _request_account_id.set(acct_id)
-        if not esm.get("Enabled", True):
-            continue
-        source_arn = esm.get("EventSourceArn", "")
-        if ":sqs:" not in source_arn:
-            continue
+    for acct_id, region, esm in _iter_all_esms():
+        account_token = _request_account_id.set(acct_id)
+        region_token = _request_region.set(region)
+        try:
+            if not esm.get("Enabled", True):
+                continue
+            source_arn = esm.get("EventSourceArn", "")
+            if ":sqs:" not in source_arn:
+                continue
 
-        func_name = esm["FunctionName"]
-        qualifier = esm.get("Qualifier")
-        func_rec, _cfg = _get_func_record_for_qualifier(func_name, qualifier)
-        if func_rec is None:
-            continue
+            func_name = esm["FunctionName"]
+            qualifier = esm.get("Qualifier")
+            func_rec, _cfg = _get_func_record_for_qualifier(func_name, qualifier)
+            if func_rec is None:
+                continue
 
-        queue_name = source_arn.split(":")[-1]
-        queue_url = _sqs._queue_url(queue_name)
-        queue = _sqs._queues.get(queue_url)
-        if not queue:
-            continue
+            queue_name = source_arn.split(":")[-1]
+            queue_url = _sqs._queue_url(queue_name)
+            queue = _sqs._queues.get(queue_url)
+            if not queue:
+                continue
 
-        batch_size = esm.get("BatchSize", 10)
-        now = time.time()
+            batch_size = esm.get("BatchSize", 10)
+            now = time.time()
 
-        batch = _sqs._receive_messages_for_esm(queue_url, batch_size)
-        if not batch:
-            continue
+            batch = _sqs._receive_messages_for_esm(queue_url, batch_size)
+            if not batch:
+                continue
 
-        records = []
-        for msg in batch:
-            first_recv = msg.get("first_receive_at") or now
-            records.append({
-                "messageId": msg["id"],
-                "receiptHandle": msg["receipt_handle"],
-                "body": msg["body"],
-                "attributes": {
-                    "ApproximateReceiveCount": str(msg.get("receive_count", 1)),
-                    "SentTimestamp": str(int(msg["sent_at"] * 1000)),
-                    "SenderId": get_account_id(),
-                    "ApproximateFirstReceiveTimestamp": str(int(first_recv * 1000)),
-                },
-                "messageAttributes": msg.get("message_attributes", {}),
-                "md5OfBody": msg.get("md5_body") or msg.get("md5") or "",
-                "eventSource": "aws:sqs",
-                "eventSourceARN": source_arn,
-                "awsRegion": get_region(),
-            })
-
-        # Apply FilterCriteria before invoking — AWS filters records out
-        # *before* the handler runs, so non-matching records are silently
-        # dropped (and immediately deleted from the queue like successful ones).
-        records = _apply_filter_criteria(records, esm)
-        if not records:
-            # All records filtered out — treat the batch as processed.
+            records = []
             for msg in batch:
-                queue["messages"].remove(msg)
-            continue
+                first_recv = msg.get("first_receive_at") or now
+                records.append({
+                    "messageId": msg["id"],
+                    "receiptHandle": msg["receipt_handle"],
+                    "body": msg["body"],
+                    "attributes": {
+                        "ApproximateReceiveCount": str(msg.get("receive_count", 1)),
+                        "SentTimestamp": str(int(msg["sent_at"] * 1000)),
+                        "SenderId": get_account_id(),
+                        "ApproximateFirstReceiveTimestamp": str(int(first_recv * 1000)),
+                    },
+                    "messageAttributes": msg.get("message_attributes", {}),
+                    "md5OfBody": msg.get("md5_body") or msg.get("md5") or "",
+                    "eventSource": "aws:sqs",
+                    "eventSourceARN": source_arn,
+                    "awsRegion": get_region(),
+                })
 
-        event = {"Records": records}
-        result = _execute_function(func_rec, event)
+            # Apply FilterCriteria before invoking — AWS filters records out
+            # *before* the handler runs, so non-matching records are silently
+            # dropped (and immediately deleted from the queue like successful ones).
+            records = _apply_filter_criteria(records, esm)
+            if not records:
+                # All records filtered out — treat the batch as processed.
+                for msg in batch:
+                    queue["messages"].remove(msg)
+                continue
 
-        if result.get("error"):
-            err_body = result.get("body") or {}
-            err_type = err_body.get("errorType") if isinstance(err_body, dict) else None
-            err_msg = err_body.get("errorMessage") if isinstance(err_body, dict) else None
-            esm["LastProcessingResult"] = "FAILED"
-            logger.warning(
-                "ESM: Lambda %s failed processing SQS batch from %s (errorType=%s errorMessage=%s)\n%s",
-                func_name, queue_name, err_type, err_msg, result.get("log", ""),
-            )
-        else:
-            # Check for ReportBatchItemFailures — partial batch response
-            failed_ids = set()
-            if "ReportBatchItemFailures" in esm.get("FunctionResponseTypes", []):
-                body = result.get("body")
-                if isinstance(body, dict):
-                    for failure in body.get("batchItemFailures", []):
-                        fid = failure.get("itemIdentifier", "")
-                        if fid:
-                            failed_ids.add(fid)
-                elif isinstance(body, str):
-                    try:
-                        parsed = json.loads(body)
-                        for failure in parsed.get("batchItemFailures", []):
+            event = {"Records": records}
+            result = _execute_function(func_rec, event)
+
+            if result.get("error"):
+                err_body = result.get("body") or {}
+                err_type = err_body.get("errorType") if isinstance(err_body, dict) else None
+                err_msg = err_body.get("errorMessage") if isinstance(err_body, dict) else None
+                esm["LastProcessingResult"] = "FAILED"
+                logger.warning(
+                    "ESM: Lambda %s failed processing SQS batch from %s (errorType=%s errorMessage=%s)\n%s",
+                    func_name, queue_name, err_type, err_msg, result.get("log", ""),
+                )
+            else:
+                # Check for ReportBatchItemFailures — partial batch response
+                failed_ids = set()
+                if "ReportBatchItemFailures" in esm.get("FunctionResponseTypes", []):
+                    body = result.get("body")
+                    if isinstance(body, dict):
+                        for failure in body.get("batchItemFailures", []):
                             fid = failure.get("itemIdentifier", "")
                             if fid:
                                 failed_ids.add(fid)
-                    except (json.JSONDecodeError, AttributeError):
-                        pass
+                    elif isinstance(body, str):
+                        try:
+                            parsed = json.loads(body)
+                            for failure in parsed.get("batchItemFailures", []):
+                                fid = failure.get("itemIdentifier", "")
+                                if fid:
+                                    failed_ids.add(fid)
+                        except (json.JSONDecodeError, AttributeError):
+                            pass
 
-            # Delete only the messages that succeeded (not in failed_ids)
-            succeeded = [msg for msg in batch if msg["id"] not in failed_ids]
-            receipt_handles = {msg["receipt_handle"] for msg in succeeded if msg.get("receipt_handle")}
-            if receipt_handles:
-                _sqs._delete_messages_for_esm(queue_url, receipt_handles)
+                # Delete only the messages that succeeded (not in failed_ids)
+                succeeded = [msg for msg in batch if msg["id"] not in failed_ids]
+                receipt_handles = {msg["receipt_handle"] for msg in succeeded if msg.get("receipt_handle")}
+                if receipt_handles:
+                    _sqs._delete_messages_for_esm(queue_url, receipt_handles)
 
-            n_failed = len(batch) - len(succeeded)
-            if n_failed:
-                esm["LastProcessingResult"] = f"OK - {len(succeeded)} records, {n_failed} partial failures"
-                logger.info("ESM: Lambda %s processed %d SQS messages from %s (%d partial failures)",
-                            func_name, len(succeeded), queue_name, n_failed)
-            else:
-                esm["LastProcessingResult"] = f"OK - {len(batch)} records"
-                logger.info("ESM: Lambda %s processed %d SQS messages from %s", func_name, len(batch), queue_name)
-            log_output = result.get("log", "")
-            if log_output:
-                logger.info("ESM: Lambda %s output:\n%s", func_name, log_output)
+                n_failed = len(batch) - len(succeeded)
+                if n_failed:
+                    esm["LastProcessingResult"] = f"OK - {len(succeeded)} records, {n_failed} partial failures"
+                    logger.info("ESM: Lambda %s processed %d SQS messages from %s (%d partial failures)",
+                                func_name, len(succeeded), queue_name, n_failed)
+                else:
+                    esm["LastProcessingResult"] = f"OK - {len(batch)} records"
+                    logger.info("ESM: Lambda %s processed %d SQS messages from %s", func_name, len(batch), queue_name)
+                log_output = result.get("log", "")
+                if log_output:
+                    logger.info("ESM: Lambda %s output:\n%s", func_name, log_output)
+        finally:
+            _request_account_id.reset(account_token)
+            _request_region.reset(region_token)
 
 
 def _poll_kinesis():
     from ministack.services import kinesis as _kin
 
-    for (acct_id, _esm_key), esm in list(_esms._data.items()):
+    for acct_id, region, esm in _iter_all_esms():
         _request_account_id.set(acct_id)
+        _request_region.set(region)
         if not esm.get("Enabled", True):
             continue
         source_arn = esm.get("EventSourceArn", "")
@@ -4394,8 +4421,9 @@ def _poll_dynamodb_streams():
     if not stream_records:
         return
 
-    for (acct_id, _esm_key), esm in list(_esms._data.items()):
+    for acct_id, region, esm in _iter_all_esms():
         _request_account_id.set(acct_id)
+        _request_region.set(region)
         if not esm.get("Enabled", True):
             continue
         source_arn = esm.get("EventSourceArn", "")

@@ -11,6 +11,7 @@ import boto3
 import pytest
 from botocore.config import Config
 from botocore.exceptions import ClientError
+from conftest import make_client
 
 _endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
 
@@ -44,6 +45,177 @@ def _zip_lambda(code: str) -> bytes:
     with zipfile.ZipFile(buf, "w") as zf:
         zf.writestr("index.py", code)
     return buf.getvalue()
+
+
+def _regional_client(service, region):
+    return make_client(service, region_name=region)
+
+
+def _region_marker_code(marker: str) -> bytes:
+    code = f"""
+import os
+
+def handler(event, context):
+    return {{
+        "marker": "{marker}",
+        "region": os.environ.get("AWS_REGION"),
+        "arn": context.invoked_function_arn,
+        "event": event,
+    }}
+"""
+    return _make_zip(code)
+
+
+def test_lambda_functions_are_region_scoped():
+    east = _regional_client("lambda", "us-east-1")
+    west = _regional_client("lambda", "us-west-2")
+    name = f"lambda-region-scope-{_uuid_mod.uuid4().hex}"
+
+    east_created = east.create_function(
+        FunctionName=name,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _region_marker_code("east")},
+    )
+    west_created = west.create_function(
+        FunctionName=name,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _region_marker_code("west")},
+    )
+
+    assert ":us-east-1:" in east_created["FunctionArn"]
+    assert ":us-west-2:" in west_created["FunctionArn"]
+    assert east_created["FunctionArn"] != west_created["FunctionArn"]
+
+    east_names = {fn["FunctionName"] for fn in east.list_functions()["Functions"]}
+    west_names = {fn["FunctionName"] for fn in west.list_functions()["Functions"]}
+    assert name in east_names
+    assert name in west_names
+
+    east_resp = east.invoke(FunctionName=name, Payload=json.dumps({"region": "east"}))
+    west_resp = west.invoke(FunctionName=name, Payload=json.dumps({"region": "west"}))
+    east_payload = json.loads(east_resp["Payload"].read())
+    west_payload = json.loads(west_resp["Payload"].read())
+    assert east_payload["marker"] == "east"
+    assert west_payload["marker"] == "west"
+    assert east_payload["region"] == "us-east-1"
+    assert west_payload["region"] == "us-west-2"
+    assert ":us-east-1:" in east_payload["arn"]
+    assert ":us-west-2:" in west_payload["arn"]
+
+
+def test_lambda_versions_aliases_and_urls_are_region_scoped():
+    east = _regional_client("lambda", "us-east-1")
+    west = _regional_client("lambda", "us-west-2")
+    name = f"lambda-region-version-{_uuid_mod.uuid4().hex}"
+
+    east.create_function(
+        FunctionName=name,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _region_marker_code("east")},
+    )
+    west.create_function(
+        FunctionName=name,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _region_marker_code("west")},
+    )
+
+    east_version = east.publish_version(FunctionName=name)
+    west_version = west.publish_version(FunctionName=name)
+    assert ":us-east-1:" in east_version["FunctionArn"]
+    assert ":us-west-2:" in west_version["FunctionArn"]
+
+    east_alias = east.create_alias(FunctionName=name, Name="live", FunctionVersion=east_version["Version"])
+    west_alias = west.create_alias(FunctionName=name, Name="live", FunctionVersion=west_version["Version"])
+    assert ":us-east-1:" in east_alias["AliasArn"]
+    assert ":us-west-2:" in west_alias["AliasArn"]
+    assert east.get_alias(FunctionName=name, Name="live")["AliasArn"] == east_alias["AliasArn"]
+    assert west.get_alias(FunctionName=name, Name="live")["AliasArn"] == west_alias["AliasArn"]
+
+    east_url = east.create_function_url_config(FunctionName=name, Qualifier="live", AuthType="NONE")
+    west_url = west.create_function_url_config(FunctionName=name, Qualifier="live", AuthType="NONE")
+    assert ".us-east-1." in east_url["FunctionUrl"]
+    assert ".us-west-2." in west_url["FunctionUrl"]
+    assert east.get_function_url_config(FunctionName=name, Qualifier="live")["FunctionUrl"] == east_url["FunctionUrl"]
+    assert west.get_function_url_config(FunctionName=name, Qualifier="live")["FunctionUrl"] == west_url["FunctionUrl"]
+
+
+def test_sfn_lambda_invoke_uses_execution_region():
+    east_lam = _regional_client("lambda", "us-east-1")
+    west_lam = _regional_client("lambda", "us-west-2")
+    east_sfn = _regional_client("stepfunctions", "us-east-1")
+    west_sfn = _regional_client("stepfunctions", "us-west-2")
+    name = f"lambda-sfn-region-{_uuid_mod.uuid4().hex}"
+
+    east = east_lam.create_function(
+        FunctionName=name,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _region_marker_code("east")},
+    )
+    west = west_lam.create_function(
+        FunctionName=name,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _region_marker_code("west")},
+    )
+
+    def _definition(function_arn):
+        return json.dumps(
+            {
+                "StartAt": "Invoke",
+                "States": {
+                    "Invoke": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::lambda:invoke",
+                        "Parameters": {
+                            "FunctionName": function_arn,
+                            "Payload": {"hello": "region"},
+                        },
+                        "End": True,
+                    }
+                },
+            }
+        )
+
+    east_sm = east_sfn.create_state_machine(
+        name=name,
+        definition=_definition(east["FunctionArn"]),
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+    west_sm = west_sfn.create_state_machine(
+        name=name,
+        definition=_definition(west["FunctionArn"]),
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+
+    east_ex = east_sfn.start_execution(stateMachineArn=east_sm["stateMachineArn"], input="{}")
+    west_ex = west_sfn.start_execution(stateMachineArn=west_sm["stateMachineArn"], input="{}")
+
+    def _wait(sfn, execution_arn):
+        for _ in range(50):
+            time.sleep(0.1)
+            desc = sfn.describe_execution(executionArn=execution_arn)
+            if desc["status"] != "RUNNING":
+                return desc
+        return desc
+
+    east_desc = _wait(east_sfn, east_ex["executionArn"])
+    west_desc = _wait(west_sfn, west_ex["executionArn"])
+    assert east_desc["status"] == "SUCCEEDED"
+    assert west_desc["status"] == "SUCCEEDED"
+    assert json.loads(east_desc["output"])["Payload"]["marker"] == "east"
+    assert json.loads(west_desc["output"])["Payload"]["marker"] == "west"
+
 
 def test_lambda_create_invoke(lam):
     code = b'def handler(event, context):\n    return {"statusCode": 200, "body": "Hello!", "event": event}\n'
@@ -3675,8 +3847,8 @@ def test_nodejs_worker_aws_sdk_v3_stub_wire_roundtrip(lam, ssm):
     router.py undetected by the resolution-only tests).
     """
     import shutil
-
     import uuid as _uuid
+
     if not shutil.which("node"):
         pytest.skip("node not found on PATH")
 

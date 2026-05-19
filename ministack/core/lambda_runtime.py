@@ -35,6 +35,17 @@ def _account_from_arn(arn: str) -> str:
     return os.environ.get("AWS_ACCESS_KEY_ID", "test")
 
 
+def _region_from_arn(arn: str) -> str:
+    """Extract the region from a Lambda function ARN."""
+    try:
+        parts = arn.split(":")
+        if len(parts) >= 4 and parts[3]:
+            return parts[3]
+    except (AttributeError, TypeError):
+        pass
+    return os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+
+
 _workers: dict = {}
 _lock = threading.Lock()
 
@@ -899,10 +910,13 @@ class Worker:
 
 def get_or_create_worker(func_name: str, config: dict, code_zip: bytes,
                          qualifier: str = "$LATEST") -> Worker:
-    # Include account ID in the key to isolate workers across accounts.
-    # Two accounts deploying the same function name must not share a worker.
-    account = _account_from_arn(config.get("FunctionArn", ""))
-    key = f"{account}:{func_name}:{qualifier}"
+    # Include account ID and region in the key to isolate workers across
+    # accounts and regions. Two regions deploying the same function name must
+    # not share a worker.
+    arn = config.get("FunctionArn", "")
+    account = _account_from_arn(arn)
+    region = _region_from_arn(arn)
+    key = f"{account}:{region}:{func_name}:{qualifier}"
     with _lock:
         worker = _workers.get(key)
         if worker is not None:
@@ -912,23 +926,32 @@ def get_or_create_worker(func_name: str, config: dict, code_zip: bytes,
         return worker
 
 
-def invalidate_worker(func_name: str, qualifier: str = None, account: str = None):
+def invalidate_worker(func_name: str, qualifier: str = None,
+                      account: str = None, region: str = None):
     """Kill and remove workers for a function.
 
     If qualifier is provided, only kill that specific version/alias worker.
     Otherwise kill all workers for the function (used on delete).
-    If account is provided, scope the invalidation to that account.
+    If account or region is provided, scope the invalidation to that account
+    and/or region.
     """
-    # Worker keys are "{account}:{func_name}:{qualifier}". Lambda function names
-    # cannot contain ':' (AWS naming rule), so splitting on ':' is unambiguous.
+    # Worker keys are "{account}:{region}:{func_name}:{qualifier}". Older
+    # in-process keys may be "{account}:{func_name}:{qualifier}" during local
+    # development, so tolerate both shapes.
     def _matches(k: str) -> bool:
         parts = k.split(":")
-        if len(parts) != 3:
+        if len(parts) == 4:
+            k_account, k_region, k_func, k_qualifier = parts
+        elif len(parts) == 3:
+            k_account, k_func, k_qualifier = parts
+            k_region = None
+        else:
             return False
-        k_account, k_func, k_qualifier = parts
         if k_func != func_name:
             return False
         if account is not None and k_account != account:
+            return False
+        if region is not None and k_region is not None and k_region != region:
             return False
         if qualifier is not None and k_qualifier != qualifier:
             return False

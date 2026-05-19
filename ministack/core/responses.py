@@ -122,6 +122,18 @@ class AccountScopedDict:
     def get(self, key, default=None):
         return self._data.get(self._scoped(key), default)
 
+    def get_scoped(self, account_id, region, key, default=None):
+        return self._data.get((account_id, region, key), default)
+
+    def set_scoped(self, account_id, region, key, value):
+        self._data[(account_id, region, key)] = value
+
+    def contains_scoped(self, account_id, region, key):
+        return (account_id, region, key) in self._data
+
+    def pop_scoped(self, account_id, region, key, *args):
+        return self._data.pop((account_id, region, key), *args)
+
     def pop(self, key, *args):
         return self._data.pop(self._scoped(key), *args)
 
