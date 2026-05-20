@@ -204,6 +204,138 @@ def test_rds_instances_are_region_scoped():
                 pass
 
 
+def test_rds_regional_instance_apis_reject_foreign_region_arns():
+    east = _regional_rds("us-east-1")
+    west = _regional_rds("us-west-2")
+    instance_id = f"rds-inst-arn-{uuid.uuid4().hex[:8]}"
+    snapshot_id = f"rds-inst-arn-snap-{uuid.uuid4().hex[:8]}"
+
+    try:
+        instance = west.create_db_instance(
+            DBInstanceIdentifier=instance_id,
+            DBInstanceClass="db.t3.micro",
+            Engine="postgres",
+            MasterUsername="admin",
+            MasterUserPassword="pass",
+            AllocatedStorage=10,
+        )["DBInstance"]
+        instance_arn = instance["DBInstanceArn"]
+
+        same_region = west.describe_db_instances(DBInstanceIdentifier=instance_arn)["DBInstances"][0]
+        assert same_region["DBInstanceIdentifier"] == instance_id
+
+        with pytest.raises(ClientError) as exc:
+            east.describe_db_instances(DBInstanceIdentifier=instance_arn)
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+
+        with pytest.raises(ClientError) as exc:
+            east.modify_db_instance(
+                DBInstanceIdentifier=instance_arn,
+                DBInstanceClass="db.t3.small",
+                ApplyImmediately=True,
+            )
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+
+        with pytest.raises(ClientError) as exc:
+            east.create_db_snapshot(
+                DBSnapshotIdentifier=snapshot_id,
+                DBInstanceIdentifier=instance_arn,
+            )
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+
+        with pytest.raises(ClientError) as exc:
+            east.delete_db_instance(DBInstanceIdentifier=instance_arn, SkipFinalSnapshot=True)
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+    finally:
+        try:
+            west.delete_db_instance(DBInstanceIdentifier=instance_id, SkipFinalSnapshot=True)
+        except ClientError:
+            pass
+
+
+def test_rds_tag_resource_arns_are_request_region_scoped():
+    east = _regional_rds("us-east-1")
+    west = _regional_rds("us-west-2")
+    cluster_id = f"rds-tag-scope-{uuid.uuid4().hex[:8]}"
+
+    try:
+        cluster = west.create_db_cluster(
+            DBClusterIdentifier=cluster_id,
+            Engine="aurora-mysql",
+            MasterUsername="admin",
+            MasterUserPassword="password123",
+        )["DBCluster"]
+        cluster_arn = cluster["DBClusterArn"]
+        bogus_account_arn = cluster_arn.replace(":000000000000:", ":111111111111:")
+
+        west.add_tags_to_resource(
+            ResourceName=cluster_arn,
+            Tags=[{"Key": "scope", "Value": "west"}],
+        )
+        assert west.list_tags_for_resource(ResourceName=cluster_arn)["TagList"] == [
+            {"Key": "scope", "Value": "west"},
+        ]
+
+        with pytest.raises(ClientError) as exc:
+            east.add_tags_to_resource(
+                ResourceName=cluster_arn,
+                Tags=[{"Key": "scope", "Value": "east"}],
+            )
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+
+        with pytest.raises(ClientError) as exc:
+            east.list_tags_for_resource(ResourceName=cluster_arn)
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+
+        with pytest.raises(ClientError) as exc:
+            west.add_tags_to_resource(
+                ResourceName=bogus_account_arn,
+                Tags=[{"Key": "scope", "Value": "bogus"}],
+            )
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+
+        assert west.describe_db_clusters(DBClusterIdentifier=cluster_id)["DBClusters"][0]["TagList"] == [
+            {"Key": "scope", "Value": "west"},
+        ]
+    finally:
+        _delete_cluster(west, cluster_id)
+
+
+def test_rds_cluster_snapshot_from_arn_stores_canonical_cluster_id():
+    east = _regional_rds("us-east-1")
+    suffix = uuid.uuid4().hex[:8]
+    cluster_id = f"rds-snap-arn-{suffix}"
+    snapshot_id = f"rds-snap-arn-{suffix}"
+
+    try:
+        cluster = east.create_db_cluster(
+            DBClusterIdentifier=cluster_id,
+            Engine="aurora-mysql",
+            MasterUsername="admin",
+            MasterUserPassword="password123",
+        )["DBCluster"]
+        east.create_db_cluster_snapshot(
+            DBClusterSnapshotIdentifier=snapshot_id,
+            DBClusterIdentifier=cluster["DBClusterArn"],
+        )
+
+        by_snapshot = east.describe_db_cluster_snapshots(
+            DBClusterSnapshotIdentifier=snapshot_id,
+        )["DBClusterSnapshots"][0]
+        assert by_snapshot["DBClusterIdentifier"] == cluster_id
+
+        by_cluster = east.describe_db_cluster_snapshots(
+            DBClusterIdentifier=cluster_id,
+        )["DBClusterSnapshots"]
+        assert any(s["DBClusterSnapshotIdentifier"] == snapshot_id for s in by_cluster)
+    finally:
+        try:
+            east.delete_db_cluster_snapshot(DBClusterSnapshotIdentifier=snapshot_id)
+        except ClientError:
+            pass
+        _delete_cluster(east, cluster_id)
+
+
 def test_describe_global_clusters_rejects_global_cluster_arns():
     account_a = _regional_rds("us-east-1", access_key_id="111111111111")
     account_b = _regional_rds("us-east-1", access_key_id="222222222222")
@@ -233,6 +365,34 @@ def test_describe_global_clusters_rejects_global_cluster_arns():
         assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
     finally:
         _delete_global_cluster(account_a, global_id)
+
+
+def test_create_db_cluster_first_global_member_is_writer():
+    east = _regional_rds("us-east-1")
+    suffix = uuid.uuid4().hex[:8]
+    global_id = f"global-empty-{suffix}"
+    cluster_id = f"global-first-{suffix}"
+
+    try:
+        east.create_global_cluster(
+            GlobalClusterIdentifier=global_id,
+            Engine="aurora-mysql",
+        )
+        cluster = east.create_db_cluster(
+            DBClusterIdentifier=cluster_id,
+            Engine="aurora-mysql",
+            GlobalClusterIdentifier=global_id,
+            MasterUsername="admin",
+            MasterUserPassword="password123",
+        )["DBCluster"]
+
+        global_cluster = east.describe_global_clusters(GlobalClusterIdentifier=global_id)["GlobalClusters"][0]
+        members = {m["DBClusterArn"]: m for m in global_cluster["GlobalClusterMembers"]}
+        assert members[cluster["DBClusterArn"]]["IsWriter"] is True
+    finally:
+        _remove_global_member(east, global_id, cluster_id)
+        _delete_cluster(east, cluster_id)
+        _delete_global_cluster(east, global_id)
 
 
 def test_aurora_global_metadata_spans_regions():

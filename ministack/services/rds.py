@@ -340,6 +340,18 @@ def _same_account_foreign_region_arn(identifier, resource_type):
     return spec
 
 
+def _request_scope_mismatch_arn(identifier, resource_type):
+    parsed = _parse_rds_arn(identifier)
+    if not parsed:
+        return None
+    spec, parsed_type, _ = parsed
+    if parsed_type != resource_type:
+        return None
+    if spec.account_id != get_account_id() or spec.region != get_region():
+        return spec
+    return None
+
+
 def _invalid_region_arn_error(identifier, parameter_name):
     spec = _same_account_foreign_region_arn(identifier, "cluster")
     if not spec:
@@ -349,6 +361,16 @@ def _invalid_region_arn_error(identifier, parameter_name):
         f"The provided ARN ({identifier}) is invalid for this parameter "
         f"({parameter_name}). Expected region = {get_region()}, "
         f"actual region = {spec.region}",
+        400,
+    )
+
+
+def _invalid_db_instance_identifier_error(identifier, parameter_name="DBInstanceIdentifier"):
+    if not _request_scope_mismatch_arn(identifier, "db"):
+        return None
+    return _error(
+        "InvalidParameterValue",
+        f"The parameter {parameter_name} is not a valid identifier because it is longer than 63 characters.",
         400,
     )
 
@@ -440,7 +462,7 @@ def _resolve_instance(db_id):
     AWS accepts either value for the DBInstanceIdentifier parameter in
     DescribeDBInstances and related APIs.
     """
-    inst = _regional_get(_instances, db_id, "db")
+    inst = _request_region_get(_instances, db_id, "db")
     if inst:
         return inst
     if isinstance(db_id, str) and db_id.startswith("db-"):
@@ -715,6 +737,9 @@ def _delete_db_instance(p):
     db_id = _p(p, "DBInstanceIdentifier")
     instance = _resolve_instance(db_id)
     if not instance:
+        invalid_arn = _invalid_db_instance_identifier_error(db_id)
+        if invalid_arn:
+            return invalid_arn
         return _error("DBInstanceNotFound", f"DBInstance {db_id} not found.", 404)
     instance_id = instance["DBInstanceIdentifier"]
 
@@ -751,6 +776,9 @@ def _describe_db_instances(p):
     if db_id:
         instance = _resolve_instance(db_id)
         if not instance:
+            invalid_arn = _invalid_db_instance_identifier_error(db_id, "Filter: db-instance-id")
+            if invalid_arn:
+                return invalid_arn
             return _error("DBInstanceNotFound", f"DBInstance {db_id} not found.", 404)
         instances = [instance]
     else:
@@ -822,6 +850,9 @@ def _modify_db_instance(p):
     db_id = _p(p, "DBInstanceIdentifier")
     instance = _resolve_instance(db_id)
     if not instance:
+        invalid_arn = _invalid_db_instance_identifier_error(db_id)
+        if invalid_arn:
+            return invalid_arn
         return _error("DBInstanceNotFound", f"DBInstance {db_id} not found.", 404)
 
     apply_immediately = _p(p, "ApplyImmediately") == "true"
@@ -894,6 +925,9 @@ def _start_db_instance(p):
     db_id = _p(p, "DBInstanceIdentifier")
     instance = _resolve_instance(db_id)
     if not instance:
+        invalid_arn = _invalid_db_instance_identifier_error(db_id)
+        if invalid_arn:
+            return invalid_arn
         return _error("DBInstanceNotFound", f"DBInstance {db_id} not found.", 404)
     instance["DBInstanceStatus"] = "available"
     return _single_instance_response("StartDBInstanceResponse", "StartDBInstanceResult", instance)
@@ -903,6 +937,9 @@ def _stop_db_instance(p):
     db_id = _p(p, "DBInstanceIdentifier")
     instance = _resolve_instance(db_id)
     if not instance:
+        invalid_arn = _invalid_db_instance_identifier_error(db_id)
+        if invalid_arn:
+            return invalid_arn
         return _error("DBInstanceNotFound", f"DBInstance {db_id} not found.", 404)
     instance["DBInstanceStatus"] = "stopped"
     return _single_instance_response("StopDBInstanceResponse", "StopDBInstanceResult", instance)
@@ -912,6 +949,9 @@ def _reboot_db_instance(p):
     db_id = _p(p, "DBInstanceIdentifier")
     instance = _resolve_instance(db_id)
     if not instance:
+        invalid_arn = _invalid_db_instance_identifier_error(db_id)
+        if invalid_arn:
+            return invalid_arn
         return _error("DBInstanceNotFound", f"DBInstance {db_id} not found.", 404)
     instance["DBInstanceStatus"] = "available"
     return _single_instance_response("RebootDBInstanceResponse", "RebootDBInstanceResult", instance)
@@ -1117,7 +1157,8 @@ def _create_db_cluster(p):
     }
     _clusters[cluster_id] = cluster
     if global_cluster:
-        _attach_cluster_to_global(global_cluster, cluster, is_writer=False)
+        is_first_member = not global_cluster.get("GlobalClusterMembers")
+        _attach_cluster_to_global(global_cluster, cluster, is_writer=is_first_member)
 
     req_tags = _parse_tags(p)
     if req_tags:
@@ -1307,6 +1348,9 @@ def _create_db_snapshot(p):
 
     instance = _resolve_instance(db_id)
     if not instance:
+        invalid_arn = _invalid_db_instance_identifier_error(db_id)
+        if invalid_arn:
+            return invalid_arn
         return _error("DBInstanceNotFound", f"DBInstance {db_id} not found.", 404)
 
     snap = _create_snapshot_internal(snap_id, instance)
@@ -1758,6 +1802,7 @@ def _create_db_cluster_snapshot(p):
         if wrong_region:
             return wrong_region
         return _error("DBClusterNotFoundFault", f"DBCluster {cluster_id} not found.", 404)
+    cluster_id = cluster["DBClusterIdentifier"]
 
     arn = f"arn:aws:rds:{get_region()}:{get_account_id()}:cluster-snapshot:{snap_id}"
     now_ts = time.time()
@@ -1974,11 +2019,34 @@ def _describe_pending_maintenance_actions(p):
 # Tags
 # ---------------------------------------------------------------------------
 
+def _tag_resource_scope_error(arn):
+    parsed = _parse_rds_arn(arn)
+    if not parsed:
+        return None
+    spec, resource_type, _ = parsed
+    if spec.account_id != get_account_id():
+        return _error(
+            "InvalidParameterValue",
+            "The specified resource name does not match an RDS resource in this region.",
+            400,
+        )
+    if resource_type != "global-cluster" and spec.region and spec.region != get_region():
+        return _error(
+            "InvalidParameterValue",
+            "The specified resource name does not match an RDS resource in this region.",
+            400,
+        )
+    return None
+
+
 def _add_tags(p):
     arn = _p(p, "ResourceName")
     new_tags = _parse_tags(p)
     if not arn:
         return _error("MissingParameter", "ResourceName is required", 400)
+    scope_error = _tag_resource_scope_error(arn)
+    if scope_error:
+        return scope_error
 
     existing = _tags.get(arn, [])
     existing_keys = {t["Key"]: i for i, t in enumerate(existing)}
@@ -2000,6 +2068,9 @@ def _remove_tags(p):
     keys_to_remove = set(_parse_member_list(p, "TagKeys"))
     if not arn:
         return _error("MissingParameter", "ResourceName is required", 400)
+    scope_error = _tag_resource_scope_error(arn)
+    if scope_error:
+        return scope_error
 
     existing = _tags.get(arn, [])
     _tags[arn] = [t for t in existing if t["Key"] not in keys_to_remove]
@@ -2013,6 +2084,9 @@ def _list_tags(p):
     if not arn:
         return _xml(200, "ListTagsForResourceResponse",
             "<ListTagsForResourceResult><TagList/></ListTagsForResourceResult>")
+    scope_error = _tag_resource_scope_error(arn)
+    if scope_error:
+        return scope_error
 
     tag_list = _tags.get(arn, [])
     members = "".join(f"<Tag><Key>{_esc(t['Key'])}</Key><Value>{_esc(t['Value'])}</Value></Tag>" for t in tag_list)
@@ -2023,15 +2097,15 @@ def _list_tags(p):
 def _sync_tag_list_to_resource(arn):
     """Keep the embedded TagList on instances/clusters in sync with _tags."""
     tag_list = _tags.get(arn, [])
-    for inst in _instances.all_values():
+    for inst in _instances.values():
         if inst.get("DBInstanceArn") == arn:
             inst["TagList"] = list(tag_list)
             return
-    for cl in _clusters.all_values():
+    for cl in _clusters.values():
         if cl.get("DBClusterArn") == arn:
             cl["TagList"] = list(tag_list)
             return
-    for snap in _snapshots.all_values():
+    for snap in _snapshots.values():
         if snap.get("DBSnapshotArn") == arn:
             snap["TagList"] = list(tag_list)
             return
