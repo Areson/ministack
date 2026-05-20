@@ -440,25 +440,19 @@ process.stdin.on('end', async () => {
 # ---------------------------------------------------------------------------
 
 
-def _resolve_name(name_or_arn: str, enforce_scope: bool = False) -> str:
+def _resolve_name(name_or_arn: str) -> str:
     """Extract plain function name from a name, partial ARN, or full ARN."""
     if not name_or_arn:
         return ""
     if name_or_arn.startswith("arn:"):
-        name, _qualifier = _lambda_function_name_and_qualifier_from_arn(
-            name_or_arn,
-            enforce_scope=enforce_scope,
-        )
+        name, _qualifier = _lambda_function_name_and_qualifier_from_arn(name_or_arn)
         return name or name_or_arn
     if ":" in name_or_arn:
         return name_or_arn.split(":")[0]
     return name_or_arn
 
 
-def _resolve_name_and_qualifier(
-    name_or_arn: str,
-    enforce_scope: bool = False,
-) -> tuple[str, str | None]:
+def _resolve_name_and_qualifier(name_or_arn: str) -> tuple[str, str | None]:
     """Extract (function_name, qualifier) from a name, partial ARN, or full ARN.
 
     Handles:
@@ -466,18 +460,11 @@ def _resolve_name_and_qualifier(
       my-function:v1             -> ("my-function", "v1")
       arn:...:function:my-func   -> ("my-func", None)
       arn:...:function:my-func:3 -> ("my-func", "3")
-
-    Callers that are resolving a Lambda API target should pass
-    ``enforce_scope=True`` so out-of-scope full ARNs cannot accidentally target
-    a same-named function in the caller's current account/region.
     """
     if not name_or_arn:
         return "", None
     if name_or_arn.startswith("arn:"):
-        name, qualifier = _lambda_function_name_and_qualifier_from_arn(
-            name_or_arn,
-            enforce_scope=enforce_scope,
-        )
+        name, qualifier = _lambda_function_name_and_qualifier_from_arn(name_or_arn)
         return (name, qualifier) if name else (name_or_arn, None)
     if ":" in name_or_arn:
         name, qualifier = name_or_arn.split(":", 1)
@@ -485,25 +472,70 @@ def _resolve_name_and_qualifier(
     return name_or_arn, None
 
 
-def _lambda_function_name_and_qualifier_from_arn(
-    value: str,
-    enforce_scope: bool = False,
-) -> tuple[str, str | None]:
+def _lambda_function_name_and_qualifier_from_arn(value: str) -> tuple[str, str | None]:
     try:
         spec = parse_arn(value)
     except ArnParseError:
         return "", None
     if spec.service != "lambda":
         return "", None
-    if enforce_scope and (
-        spec.account_id != get_account_id() or spec.region != get_region()
-    ):
-        return "", None
     parts = spec.resource.split(":", 2)
     if len(parts) < 2 or parts[0] != "function" or not parts[1]:
         return "", None
     qualifier = parts[2] if len(parts) == 3 and parts[2] else None
     return parts[1], qualifier
+
+
+def _resolve_request_scoped_name(name_or_arn: str) -> str:
+    """Resolve a Lambda API target without crossing account/region scope.
+
+    Legacy integration adapters intentionally use _resolve_name for backwards
+    compatibility. Direct Lambda APIs use this helper so malformed or foreign
+    ARNs remain unresolved instead of falling through to a same-named local
+    function in the caller's current scope.
+    """
+    name, _qualifier = _resolve_request_scoped_name_and_qualifier(name_or_arn)
+    return name
+
+
+def _resolve_request_scoped_name_and_qualifier(name_or_arn: str) -> tuple[str, str | None]:
+    if not name_or_arn:
+        return "", None
+    if not name_or_arn.startswith("arn:"):
+        return _resolve_name_and_qualifier(name_or_arn)
+    try:
+        spec = parse_arn(name_or_arn)
+    except ArnParseError:
+        return name_or_arn, None
+    if (
+        spec.service != "lambda"
+        or spec.account_id != get_account_id()
+        or spec.region != get_region()
+    ):
+        return name_or_arn, None
+    name, qualifier = _lambda_function_name_and_qualifier_from_arn(name_or_arn)
+    return (name, qualifier) if name else (name_or_arn, None)
+
+
+def _lambda_function_account_region_from_arn(value: str) -> tuple[str, str]:
+    spec = parse_arn(value)
+    if spec.service != "lambda":
+        raise ArnParseError("arn: expected lambda service")
+    if not _12_DIGIT_RE.match(spec.account_id):
+        raise ArnParseError("arn: expected 12-digit account id")
+    if not spec.region:
+        raise ArnParseError("arn: expected region")
+    name, _qualifier = _lambda_function_name_and_qualifier_from_arn(value)
+    if not name:
+        raise ArnParseError("arn: expected lambda function resource")
+    return spec.account_id, spec.region
+
+
+def _account_region_from_function_config(config: dict) -> tuple[str, str]:
+    arn = config.get("FunctionArn", "")
+    if arn:
+        return _lambda_function_account_region_from_arn(arn)
+    return get_account_id(), get_region()
 
 
 def _func_arn(name: str) -> str:
@@ -777,14 +809,14 @@ async def handle_request(method: str, path: str, headers: dict, body: bytes, que
     # --- Event Invoke Config list: GET /2019-09-25/functions/{name}/event-invoke-config/list ---
     if "/event-invoke-config/list" in path:
         m = re.search(r"/functions/([^/]+)/event-invoke-config/list", path)
-        fname = _resolve_name(m.group(1), enforce_scope=True) if m else ""
+        fname = _resolve_request_scoped_name(m.group(1)) if m else ""
         if method == "GET":
             return _list_function_event_invoke_configs(fname, query_params)
 
     # --- Event Invoke Config: /2019-09-25/functions/{name}/event-invoke-config ---
     if "event-invoke-config" in path:
         m = re.search(r"/functions/([^/]+)/event-invoke-config", path)
-        fname = _resolve_name(m.group(1), enforce_scope=True) if m else ""
+        fname = _resolve_request_scoped_name(m.group(1)) if m else ""
         if method == "GET":
             return _get_event_invoke_config(fname)
         if method == "PUT":
@@ -795,7 +827,7 @@ async def handle_request(method: str, path: str, headers: dict, body: bytes, que
     # --- Provisioned Concurrency: /2019-09-30/functions/{name}/provisioned-concurrency ---
     if "provisioned-concurrency" in path:
         m = re.search(r"/functions/([^/]+)/provisioned-concurrency", path)
-        fname = _resolve_name(m.group(1), enforce_scope=True) if m else ""
+        fname = _resolve_request_scoped_name(m.group(1)) if m else ""
         qualifier = _qp_first(query_params, "Qualifier")
         if method == "GET":
             return _get_provisioned_concurrency(fname, qualifier)
@@ -809,7 +841,7 @@ async def handle_request(method: str, path: str, headers: dict, body: bytes, que
     # CSC ARN (empty when no config is attached).
     if "code-signing-config" in path:
         m = re.search(r"/functions/([^/]+)/code-signing-config", path)
-        fname = _resolve_name(m.group(1), enforce_scope=True) if m else ""
+        fname = _resolve_request_scoped_name(m.group(1)) if m else ""
         if fname and fname in _functions:
             csc_arn = _functions[fname].get("code_signing_config_arn", "") or ""
             if method == "GET":
@@ -831,12 +863,12 @@ async def handle_request(method: str, path: str, headers: dict, body: bytes, que
     # --- Function URL Config ---
     if "/urls" in path and "/functions/" in path:
         m = re.search(r"/functions/([^/]+)/urls", path)
-        fname = _resolve_name(m.group(1), enforce_scope=True) if m else ""
+        fname = _resolve_request_scoped_name(m.group(1)) if m else ""
         if method == "GET":
             return _list_function_url_configs(fname, query_params)
     if "/url" in path and "/functions/" in path:
         m = re.search(r"/functions/([^/]+)/url", path)
-        fname = _resolve_name(m.group(1), enforce_scope=True) if m else ""
+        fname = _resolve_request_scoped_name(m.group(1)) if m else ""
         qualifier = _qp_first(query_params, "Qualifier") or None
         if method == "POST":
             return _create_function_url_config(fname, data, qualifier)
@@ -859,7 +891,7 @@ async def handle_request(method: str, path: str, headers: dict, body: bytes, que
         if not raw_name:
             return error_response_json("InvalidParameterValueException", "Missing function name", 400)
 
-        func_name, path_qualifier = _resolve_name_and_qualifier(raw_name, enforce_scope=True)
+        func_name, path_qualifier = _resolve_request_scoped_name_and_qualifier(raw_name)
         sub = parts[4] if len(parts) > 4 else None
         sub2 = parts[5] if len(parts) > 5 else None
 
@@ -1634,10 +1666,7 @@ _reaper_lock = threading.Lock()
 
 
 def _warm_pool_key(func_name: str, config: dict) -> str:
-    arn = config.get("FunctionArn", "")
-    parts = arn.split(":")
-    acct = parts[4] if len(parts) > 4 and parts[4] else get_account_id()
-    region = parts[3] if len(parts) > 3 and parts[3] else get_region()
+    acct, region = _account_region_from_function_config(config)
     if config.get("PackageType") == "Image":
         return f"{acct}:{region}:{func_name}:image:{config.get('ImageUri', '')}"
     return f"{acct}:{region}:{func_name}:zip:{config.get('CodeSha256', 'nosha')}"
@@ -2285,7 +2314,7 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None):
     container_env: dict[str, str] = {
         "AWS_DEFAULT_REGION": get_region(),
         "AWS_REGION": get_region(),
-        "AWS_ACCESS_KEY_ID": _account_from_arn(config.get("FunctionArn", "")),
+        "AWS_ACCESS_KEY_ID": _account_region_from_function_config(config)[0],
         "AWS_SECRET_ACCESS_KEY": os.environ.get("AWS_SECRET_ACCESS_KEY", "test"),
         "AWS_SESSION_TOKEN": os.environ.get("AWS_SESSION_TOKEN", ""),
         "AWS_LAMBDA_FUNCTION_NAME": config["FunctionName"],
@@ -2966,7 +2995,7 @@ def _execute_function_provided(func: dict, event: dict) -> dict:
                     "AWS_LAMBDA_RUNTIME_API": f"127.0.0.1:{port}",
                     "AWS_DEFAULT_REGION": get_region(),
                     "AWS_REGION": get_region(),
-                    "AWS_ACCESS_KEY_ID": _account_from_arn(config.get("FunctionArn", "")),
+                    "AWS_ACCESS_KEY_ID": _account_region_from_function_config(config)[0],
                     "AWS_SECRET_ACCESS_KEY": os.environ.get("AWS_SECRET_ACCESS_KEY", "test"),
                     "AWS_LAMBDA_FUNCTION_NAME": config.get("FunctionName", "unknown"),
                     "LAMBDA_TASK_ROOT": code_dir,
@@ -3104,7 +3133,7 @@ def _execute_function_local(func: dict, event: dict) -> dict:
                 {
                     "AWS_DEFAULT_REGION": get_region(),
                     "AWS_REGION": get_region(),
-                    "AWS_ACCESS_KEY_ID": _account_from_arn(config.get("FunctionArn", "")),
+                    "AWS_ACCESS_KEY_ID": _account_region_from_function_config(config)[0],
                     "AWS_SECRET_ACCESS_KEY": os.environ.get("AWS_SECRET_ACCESS_KEY", "test"),
                     "AWS_SESSION_TOKEN": os.environ.get("AWS_SESSION_TOKEN", ""),
                     "AWS_LAMBDA_FUNCTION_NAME": config["FunctionName"],
@@ -3529,7 +3558,7 @@ def _list_tags(resource_arn: str):
                 404,
             )
         return json_response({"Tags": esm.get("Tags", {})})
-    func_name = _resolve_name(resource_arn, enforce_scope=True)
+    func_name = _resolve_request_scoped_name(resource_arn)
     if func_name not in _functions:
         return error_response_json(
             "ResourceNotFoundException",
@@ -3551,7 +3580,7 @@ def _tag_resource(resource_arn: str, data: dict):
             )
         esm.setdefault("Tags", {}).update(data.get("Tags", {}))
         return 204, {}, b""
-    func_name = _resolve_name(resource_arn, enforce_scope=True)
+    func_name = _resolve_request_scoped_name(resource_arn)
     if func_name not in _functions:
         return error_response_json(
             "ResourceNotFoundException",
@@ -3585,7 +3614,7 @@ def _untag_resource(resource_arn: str, query_params: dict):
             tags.pop(k.strip(), None)
         return 204, {}, b""
 
-    func_name = _resolve_name(resource_arn, enforce_scope=True)
+    func_name = _resolve_request_scoped_name(resource_arn)
     if func_name not in _functions:
         return error_response_json(
             "ResourceNotFoundException",
@@ -4123,9 +4152,8 @@ def _create_esm(data: dict):
     esm_id = new_uuid()
     # Preserve the alias/version qualifier if the caller supplied one so
     # poller invocations route to the correct target (#407).
-    func_name, qualifier = _resolve_name_and_qualifier(
+    func_name, qualifier = _resolve_request_scoped_name_and_qualifier(
         data.get("FunctionName", ""),
-        enforce_scope=True,
     )
     event_source_arn = data.get("EventSourceArn", "")
 
@@ -4171,7 +4199,7 @@ def _get_esm(esm_id: str):
 
 
 def _list_esms(query_params: dict):
-    func = _resolve_name(_qp_first(query_params, "FunctionName"), enforce_scope=True)
+    func = _resolve_request_scoped_name(_qp_first(query_params, "FunctionName"))
     source_arn = _qp_first(query_params, "EventSourceArn")
     marker = _qp_first(query_params, "Marker")
     max_items = int(_qp_first(query_params, "MaxItems", "100"))
@@ -4221,7 +4249,7 @@ def _update_esm(esm_id: str, data: dict):
         esm["Enabled"] = data["Enabled"]
         esm["State"] = "Enabled" if data["Enabled"] else "Disabled"
     if "FunctionName" in data:
-        new_name = _resolve_name(data["FunctionName"], enforce_scope=True)
+        new_name = _resolve_request_scoped_name(data["FunctionName"])
         esm["FunctionName"] = new_name
         esm["FunctionArn"] = _func_arn(new_name)
     esm["LastModified"] = int(time.time())

@@ -3814,6 +3814,41 @@ def test_lambda_resolve_name_and_qualifier_uses_resource_tail():
         set_request_region(original_region)
 
 
+def test_lambda_request_scoped_resolver_does_not_fall_back_for_foreign_or_malformed_arns():
+    from ministack.services.lambda_svc import (
+        _resolve_request_scoped_name,
+        _resolve_request_scoped_name_and_qualifier,
+    )
+
+    original_account = get_account_id()
+    original_region = get_region()
+    try:
+        set_request_account_id("123456789012")
+        set_request_region("us-east-1")
+
+        scoped_arn = "arn:aws:lambda:us-east-1:123456789012:function:my-func:live"
+        foreign_region_arn = "arn:aws:lambda:us-west-2:123456789012:function:my-func:live"
+        malformed_resource_arn = "arn:aws:lambda:us-east-1:123456789012:function"
+
+        assert _resolve_request_scoped_name_and_qualifier(scoped_arn) == ("my-func", "live")
+        assert _resolve_request_scoped_name_and_qualifier("my-func:live") == ("my-func", "live")
+        assert _resolve_request_scoped_name(foreign_region_arn) == foreign_region_arn
+        assert _resolve_request_scoped_name(malformed_resource_arn) == malformed_resource_arn
+    finally:
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_lambda_function_config_account_region_rejects_malformed_arn():
+    from ministack.core.arn import ArnParseError
+    from ministack.services.lambda_svc import _account_region_from_function_config
+
+    with pytest.raises(ArnParseError):
+        _account_region_from_function_config({
+            "FunctionArn": "arn:aws:lambda:us-east-1:not-a-number:function:my-func",
+        })
+
+
 def test_lambda_restore_state_starts_poller_for_non_default_scoped_esms(monkeypatch):
     from ministack.core.responses import AccountRegionScopedDict
 

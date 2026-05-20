@@ -47,6 +47,27 @@ def _region_from_arn(arn: str) -> str:
     return os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
 
 
+def _lambda_function_account_region_from_arn(arn: str) -> tuple[str, str]:
+    spec = parse_arn(arn)
+    if spec.service != "lambda":
+        raise ArnParseError("arn: expected lambda service")
+    if not _12_DIGIT_RE.match(spec.account_id):
+        raise ArnParseError("arn: expected 12-digit account id")
+    if not spec.region:
+        raise ArnParseError("arn: expected region")
+    parts = spec.resource.split(":", 2)
+    if len(parts) < 2 or parts[0] != "function" or not parts[1]:
+        raise ArnParseError("arn: expected lambda function resource")
+    return spec.account_id, spec.region
+
+
+def _account_region_from_function_config(config: dict) -> tuple[str, str]:
+    arn = config.get("FunctionArn", "")
+    if arn:
+        return _lambda_function_account_region_from_arn(arn)
+    return _account_from_arn(arn), _region_from_arn(arn)
+
+
 _workers: dict = {}
 _lock = threading.Lock()
 
@@ -682,7 +703,7 @@ class Worker:
         from ministack.core.responses import get_region, new_uuid
         spawn_env.setdefault("AWS_REGION", get_region())
         spawn_env.setdefault("AWS_DEFAULT_REGION", get_region())
-        spawn_env.setdefault("AWS_ACCESS_KEY_ID", _account_from_arn(self.config.get("FunctionArn", "")))
+        spawn_env.setdefault("AWS_ACCESS_KEY_ID", _account_region_from_function_config(self.config)[0])
         spawn_env.setdefault("AWS_SECRET_ACCESS_KEY", os.environ.get("AWS_SECRET_ACCESS_KEY", "test"))
         spawn_env.setdefault("AWS_SESSION_TOKEN", os.environ.get("AWS_SESSION_TOKEN", ""))
         # AWS_ENDPOINT_URL precedence matches real AWS: function
@@ -914,9 +935,7 @@ def get_or_create_worker(func_name: str, config: dict, code_zip: bytes,
     # Include account ID and region in the key to isolate workers across
     # accounts and regions. Two regions deploying the same function name must
     # not share a worker.
-    arn = config.get("FunctionArn", "")
-    account = _account_from_arn(arn)
-    region = _region_from_arn(arn)
+    account, region = _account_region_from_function_config(config)
     key = f"{account}:{region}:{func_name}:{qualifier}"
     with _lock:
         worker = _workers.get(key)
