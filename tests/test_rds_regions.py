@@ -1,12 +1,23 @@
 import uuid
 
+import boto3
 import pytest
+from botocore.config import Config
 from botocore.exceptions import ClientError
-from conftest import make_client
+from conftest import ENDPOINT, make_client
 
 
-def _regional_rds(region):
-    return make_client("rds", region_name=region)
+def _regional_rds(region, access_key_id="test"):
+    if access_key_id == "test":
+        return make_client("rds", region_name=region)
+    return boto3.client(
+        "rds",
+        endpoint_url=ENDPOINT,
+        aws_access_key_id=access_key_id,
+        aws_secret_access_key="test",
+        region_name=region,
+        config=Config(region_name=region, retries={"mode": "standard"}),
+    )
 
 
 def _delete_cluster(client, cluster_id):
@@ -88,6 +99,73 @@ def test_rds_clusters_are_region_scoped():
             _delete_cluster(client, cluster_id)
 
 
+def test_rds_cluster_arn_lookup_rejects_foreign_account():
+    account_a = _regional_rds("us-west-2", access_key_id="111111111111")
+    account_b = _regional_rds("us-west-2", access_key_id="222222222222")
+    cluster_id = f"rds-cross-account-{uuid.uuid4().hex[:8]}"
+
+    try:
+        cluster = account_a.create_db_cluster(
+            DBClusterIdentifier=cluster_id,
+            Engine="aurora-mysql",
+            MasterUsername="admin",
+            MasterUserPassword="password123",
+        )["DBCluster"]
+
+        same_account = account_a.describe_db_clusters(
+            DBClusterIdentifier=cluster["DBClusterArn"],
+        )["DBClusters"][0]
+        assert same_account["DBClusterIdentifier"] == cluster_id
+
+        with pytest.raises(ClientError) as exc:
+            account_b.describe_db_clusters(DBClusterIdentifier=cluster["DBClusterArn"])
+        assert exc.value.response["Error"]["Code"] == "DBClusterNotFoundFault"
+    finally:
+        _delete_cluster(account_a, cluster_id)
+
+
+def test_rds_regional_cluster_apis_reject_foreign_region_arns():
+    east = _regional_rds("us-east-1")
+    west = _regional_rds("us-west-2")
+    cluster_id = f"rds-foreign-region-{uuid.uuid4().hex[:8]}"
+
+    try:
+        cluster = west.create_db_cluster(
+            DBClusterIdentifier=cluster_id,
+            Engine="aurora-mysql",
+            MasterUsername="admin",
+            MasterUserPassword="password123",
+        )["DBCluster"]
+        cluster_arn = cluster["DBClusterArn"]
+
+        same_region = west.describe_db_clusters(
+            DBClusterIdentifier=cluster_arn,
+        )["DBClusters"][0]
+        assert same_region["DBClusterIdentifier"] == cluster_id
+
+        with pytest.raises(ClientError) as exc:
+            east.describe_db_clusters(DBClusterIdentifier=cluster_arn)
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+
+        with pytest.raises(ClientError) as exc:
+            east.modify_db_cluster(
+                DBClusterIdentifier=cluster_arn,
+                BackupRetentionPeriod=1,
+                ApplyImmediately=True,
+            )
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+
+        with pytest.raises(ClientError) as exc:
+            east.delete_db_cluster(DBClusterIdentifier=cluster_arn, SkipFinalSnapshot=True)
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+
+        with pytest.raises(ClientError) as exc:
+            east.enable_http_endpoint(ResourceArn=cluster_arn)
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundFault"
+    finally:
+        _delete_cluster(west, cluster_id)
+
+
 def test_rds_instances_are_region_scoped():
     east = _regional_rds("us-east-1")
     west = _regional_rds("us-west-2")
@@ -124,6 +202,37 @@ def test_rds_instances_are_region_scoped():
                 client.delete_db_instance(DBInstanceIdentifier=shared, SkipFinalSnapshot=True)
             except ClientError:
                 pass
+
+
+def test_describe_global_clusters_rejects_global_cluster_arns():
+    account_a = _regional_rds("us-east-1", access_key_id="111111111111")
+    account_b = _regional_rds("us-east-1", access_key_id="222222222222")
+    global_id = f"global-cross-account-{uuid.uuid4().hex[:8]}"
+
+    try:
+        global_cluster = account_a.create_global_cluster(
+            GlobalClusterIdentifier=global_id,
+            Engine="aurora-mysql",
+        )["GlobalCluster"]
+
+        same_account = account_a.describe_global_clusters(
+            GlobalClusterIdentifier=global_id,
+        )["GlobalClusters"][0]
+        assert same_account["GlobalClusterIdentifier"] == global_id
+
+        with pytest.raises(ClientError) as exc:
+            account_a.describe_global_clusters(
+                GlobalClusterIdentifier=global_cluster["GlobalClusterArn"],
+            )
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+
+        with pytest.raises(ClientError) as exc:
+            account_b.describe_global_clusters(
+                GlobalClusterIdentifier=global_cluster["GlobalClusterArn"],
+            )
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+    finally:
+        _delete_global_cluster(account_a, global_id)
 
 
 def test_aurora_global_metadata_spans_regions():
@@ -188,7 +297,14 @@ def test_aurora_global_metadata_spans_regions():
             east.delete_global_cluster(GlobalClusterIdentifier=global_id)
         assert exc.value.response["Error"]["Code"] == "InvalidGlobalClusterStateFault"
 
-        west.remove_from_global_cluster(
+        with pytest.raises(ClientError) as exc:
+            west.remove_from_global_cluster(
+                GlobalClusterIdentifier=global_id,
+                DbClusterIdentifier=primary["DBClusterArn"],
+            )
+        assert exc.value.response["Error"]["Code"] == "InvalidGlobalClusterStateFault"
+
+        east.remove_from_global_cluster(
             GlobalClusterIdentifier=global_id,
             DbClusterIdentifier=secondary["DBClusterArn"],
         )

@@ -306,24 +306,100 @@ def _regional_get(store, identifier, resource_type):
         spec, parsed_type, resource_id = parsed
         if parsed_type != resource_type:
             return None
+        if spec.account_id != get_account_id():
+            return None
         return store.get_scoped(spec.account_id, spec.region, resource_id)
     return store.get(identifier)
 
 
+def _request_region_get(store, identifier, resource_type):
+    parsed = _parse_rds_arn(identifier)
+    if parsed:
+        spec, parsed_type, resource_id = parsed
+        if parsed_type != resource_type:
+            return None
+        if spec.account_id != get_account_id():
+            return None
+        if spec.region != get_region():
+            return None
+        return store.get(resource_id)
+    return store.get(identifier)
+
+
+def _same_account_foreign_region_arn(identifier, resource_type):
+    parsed = _parse_rds_arn(identifier)
+    if not parsed:
+        return None
+    spec, parsed_type, _ = parsed
+    if parsed_type != resource_type:
+        return None
+    if spec.account_id != get_account_id():
+        return None
+    if spec.region == get_region():
+        return None
+    return spec
+
+
+def _invalid_region_arn_error(identifier, parameter_name):
+    spec = _same_account_foreign_region_arn(identifier, "cluster")
+    if not spec:
+        return None
+    return _error(
+        "InvalidParameterValue",
+        f"The provided ARN ({identifier}) is invalid for this parameter "
+        f"({parameter_name}). Expected region = {get_region()}, "
+        f"actual region = {spec.region}",
+        400,
+    )
+
+
+def _invalid_cluster_identifier_error(identifier):
+    if not _same_account_foreign_region_arn(identifier, "cluster"):
+        return None
+    return _error(
+        "InvalidParameterValue",
+        f"Invalid database cluster identifier:  {identifier}",
+        400,
+    )
+
+
+def _resource_not_found_error_for_arn(identifier):
+    if not _same_account_foreign_region_arn(identifier, "cluster"):
+        return None
+    return _error("ResourceNotFoundFault", f"DB cluster ARN {identifier} wasn't found.", 404)
+
+
 def _resolve_cluster(cluster_id):
-    """Look up a DB cluster by identifier in the request region or by ARN region."""
+    """Look up a DB cluster by identifier in the request region or by ARN region.
+
+    Use this only for data-plane or global-topology operations whose AWS
+    semantics intentionally follow same-account member ARNs across Regions.
+    Normal regional control-plane APIs should use
+    ``_resolve_cluster_in_request_region``.
+    """
     return _regional_get(_clusters, cluster_id, "cluster")
 
 
+def _resolve_cluster_in_request_region(cluster_id):
+    """Look up a DB cluster only in the request Region."""
+    return _request_region_get(_clusters, cluster_id, "cluster")
+
+
 def _resolve_global_cluster(global_id):
-    """Look up a global cluster by identifier or global-cluster ARN."""
-    parsed = _parse_rds_arn(global_id)
-    if parsed:
-        spec, resource_type, resource_id = parsed
-        if resource_type != "global-cluster":
-            return None
-        return _global_clusters._data.get((spec.account_id, resource_id))
+    """Look up a global cluster by identifier."""
+    if _parse_rds_arn(global_id):
+        return None
     return _global_clusters.get(global_id)
+
+
+def _invalid_global_cluster_identifier_error(global_id):
+    parsed = _parse_rds_arn(global_id)
+    if not parsed:
+        return None
+    _, resource_type, _ = parsed
+    if resource_type != "global-cluster":
+        return None
+    return _error("InvalidParameterValue", f"Invalid global cluster identifier:  {global_id}", 400)
 
 
 def _global_cluster_member(cluster, is_writer):
@@ -379,7 +455,7 @@ def _register_instance_in_cluster(instance):
     cid = instance.get("DBClusterIdentifier")
     if not cid:
         return
-    cluster = _resolve_cluster(cid)
+    cluster = _resolve_cluster_in_request_region(cid)
     if not cluster:
         return
     members = cluster.setdefault("DBClusterMembers", [])
@@ -422,7 +498,7 @@ def _create_db_instance(p):
 
     # Inherit credentials from cluster when instance is a cluster member.
     cluster_id_param = _p(p, "DBClusterIdentifier")
-    parent = _resolve_cluster(cluster_id_param) if cluster_id_param else None
+    parent = _resolve_cluster_in_request_region(cluster_id_param) if cluster_id_param else None
     if parent:
         cluster_id_param = parent["DBClusterIdentifier"]
         if not _p(p, "MasterUsername"):
@@ -1054,8 +1130,11 @@ def _create_db_cluster(p):
 
 def _delete_db_cluster(p):
     cluster_id = _p(p, "DBClusterIdentifier")
-    cluster = _resolve_cluster(cluster_id)
+    cluster = _resolve_cluster_in_request_region(cluster_id)
     if not cluster:
+        wrong_region = _invalid_cluster_identifier_error(cluster_id)
+        if wrong_region:
+            return wrong_region
         return _error("DBClusterNotFoundFault", f"DBCluster {cluster_id} not found.", 404)
 
     if cluster.get("DeletionProtection"):
@@ -1081,8 +1160,11 @@ def _delete_db_cluster(p):
 def _describe_db_clusters(p):
     cluster_id = _p(p, "DBClusterIdentifier")
     if cluster_id:
-        cluster = _resolve_cluster(cluster_id)
+        cluster = _resolve_cluster_in_request_region(cluster_id)
         if not cluster:
+            wrong_region = _invalid_region_arn_error(cluster_id, "DBClusterIdentifier")
+            if wrong_region:
+                return wrong_region
             return _error("DBClusterNotFoundFault", f"DBCluster {cluster_id} not found.", 404)
         clusters = [cluster]
     else:
@@ -1130,8 +1212,11 @@ def _rotate_real_password(cluster, old_pass, new_pass):
 
 def _modify_db_cluster(p):
     cluster_id = _p(p, "DBClusterIdentifier")
-    cluster = _resolve_cluster(cluster_id)
+    cluster = _resolve_cluster_in_request_region(cluster_id)
     if not cluster:
+        wrong_region = _invalid_cluster_identifier_error(cluster_id)
+        if wrong_region:
+            return wrong_region
         return _error("DBClusterNotFoundFault", f"DBCluster {cluster_id} not found.", 404)
 
     if _p(p, "EngineVersion"):
@@ -1667,8 +1752,11 @@ def _create_db_cluster_snapshot(p):
         return _error("DBClusterSnapshotAlreadyExistsFault",
             f"DB cluster snapshot {snap_id} already exists.", 400)
 
-    cluster = _resolve_cluster(cluster_id)
+    cluster = _resolve_cluster_in_request_region(cluster_id)
     if not cluster:
+        wrong_region = _invalid_region_arn_error(cluster_id, "DBClusterIdentifier")
+        if wrong_region:
+            return wrong_region
         return _error("DBClusterNotFoundFault", f"DBCluster {cluster_id} not found.", 404)
 
     arn = f"arn:aws:rds:{get_region()}:{get_account_id()}:cluster-snapshot:{snap_id}"
@@ -1773,8 +1861,11 @@ def _modify_subnet_group(p):
 
 def _start_db_cluster(p):
     cluster_id = _p(p, "DBClusterIdentifier")
-    cluster = _resolve_cluster(cluster_id)
+    cluster = _resolve_cluster_in_request_region(cluster_id)
     if not cluster:
+        wrong_region = _invalid_region_arn_error(cluster_id, "DBClusterIdentifier")
+        if wrong_region:
+            return wrong_region
         return _error("DBClusterNotFoundFault", f"DBCluster {cluster_id} not found.", 404)
     cluster["Status"] = "available"
     return _xml(200, "StartDBClusterResponse",
@@ -1783,8 +1874,11 @@ def _start_db_cluster(p):
 
 def _stop_db_cluster(p):
     cluster_id = _p(p, "DBClusterIdentifier")
-    cluster = _resolve_cluster(cluster_id)
+    cluster = _resolve_cluster_in_request_region(cluster_id)
     if not cluster:
+        wrong_region = _invalid_region_arn_error(cluster_id, "DBClusterIdentifier")
+        if wrong_region:
+            return wrong_region
         return _error("DBClusterNotFoundFault", f"DBCluster {cluster_id} not found.", 404)
     cluster["Status"] = "stopped"
     return _xml(200, "StopDBClusterResponse",
@@ -1971,8 +2065,14 @@ def _create_global_cluster(p):
 
     source_cluster = None
     if source_cluster_id:
-        source_cluster = _resolve_cluster(source_cluster_id)
+        source_cluster = _resolve_cluster_in_request_region(source_cluster_id)
         if not source_cluster:
+            wrong_region = _invalid_region_arn_error(
+                source_cluster_id,
+                "SourceDBClusterIdentifier",
+            )
+            if wrong_region:
+                return wrong_region
             return _error("DBClusterNotFoundFault",
                 f"DBCluster {source_cluster_id} not found.", 404)
         engine = source_cluster["Engine"]
@@ -2000,6 +2100,9 @@ def _create_global_cluster(p):
 def _describe_global_clusters(p):
     gc_id = _p(p, "GlobalClusterIdentifier")
     if gc_id:
+        invalid_id = _invalid_global_cluster_identifier_error(gc_id)
+        if invalid_id:
+            return invalid_id
         gc = _resolve_global_cluster(gc_id)
         if not gc:
             return _error("GlobalClusterNotFoundFault",
@@ -2017,6 +2120,9 @@ def _describe_global_clusters(p):
 
 def _delete_global_cluster(p):
     gc_id = _p(p, "GlobalClusterIdentifier")
+    invalid_id = _invalid_global_cluster_identifier_error(gc_id)
+    if invalid_id:
+        return invalid_id
     gc = _resolve_global_cluster(gc_id)
     if not gc:
         return _error("GlobalClusterNotFoundFault",
@@ -2039,6 +2145,9 @@ def _delete_global_cluster(p):
 def _remove_from_global_cluster(p):
     gc_id = _p(p, "GlobalClusterIdentifier")
     db_cluster_id = _p(p, "DbClusterIdentifier")
+    invalid_id = _invalid_global_cluster_identifier_error(gc_id)
+    if invalid_id:
+        return invalid_id
     gc = _resolve_global_cluster(gc_id)
     if not gc:
         return _error("GlobalClusterNotFoundFault",
@@ -2068,6 +2177,9 @@ def _remove_from_global_cluster(p):
 
 def _modify_global_cluster(p):
     gc_id = _p(p, "GlobalClusterIdentifier")
+    invalid_id = _invalid_global_cluster_identifier_error(gc_id)
+    if invalid_id:
+        return invalid_id
     gc = _resolve_global_cluster(gc_id)
     if not gc:
         return _error("GlobalClusterNotFoundFault",
@@ -2099,7 +2211,7 @@ def _modify_global_cluster(p):
 
 def _enable_http_endpoint(p):
     arn = _p(p, "ResourceArn")
-    cluster = _resolve_cluster(arn)
+    cluster = _resolve_cluster_in_request_region(arn)
     if cluster:
         cluster["HttpEndpointEnabled"] = True
         return _xml(200, "EnableHttpEndpointResponse",
@@ -2107,6 +2219,9 @@ def _enable_http_endpoint(p):
             f"<ResourceArn>{arn}</ResourceArn>"
             f"<HttpEndpointEnabled>true</HttpEndpointEnabled>"
             f"</EnableHttpEndpointResult>")
+    wrong_region = _resource_not_found_error_for_arn(arn)
+    if wrong_region:
+        return wrong_region
     return _error("DBClusterNotFoundFault", f"Cluster with ARN {arn} not found.", 404)
 
 

@@ -1364,6 +1364,7 @@ def test_sfn_xml_list_wrapper_single_element(sfn, sfn_sync):
 
     sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
 
+
 def test_sfn_aws_sdk_rds_not_found_error(sfn, sfn_sync):
     """aws-sdk:rds DescribeDBClusters on missing cluster propagates error."""
     import uuid as _uuid
@@ -1395,6 +1396,59 @@ def test_sfn_aws_sdk_rds_not_found_error(sfn, sfn_sync):
     assert resp.get("error") == "Rds.DbClusterNotFoundException"
 
     sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
+def test_sfn_aws_sdk_rds_foreign_region_arn_mismatch_is_generic_rds_exception(sfn_sync):
+    """AWS maps RDS regional ARN mismatches to generic Rds.RdsException."""
+    west_rds = make_client("rds", region_name="us-west-2")
+    cluster_id = f"sdk-rds-region-mismatch-{_uuid_mod.uuid4().hex[:8]}"
+    sm_name = f"sdk-rds-region-mismatch-{_uuid_mod.uuid4().hex[:8]}"
+    sm_arn = None
+
+    try:
+        cluster = west_rds.create_db_cluster(
+            DBClusterIdentifier=cluster_id,
+            Engine="aurora-mysql",
+            MasterUsername="admin",
+            MasterUserPassword="password123",
+        )["DBCluster"]
+
+        definition = json.dumps({
+            "StartAt": "DescribeForeignRegionArn",
+            "States": {
+                "DescribeForeignRegionArn": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::aws-sdk:rds:DescribeDBClusters",
+                    "Parameters": {
+                        "DBClusterIdentifier": cluster["DBClusterArn"],
+                    },
+                    "End": True,
+                },
+            },
+        })
+
+        sm_arn = sfn_sync.create_state_machine(
+            name=sm_name,
+            definition=definition,
+            roleArn="arn:aws:iam::000000000000:role/sfn-role",
+        )["stateMachineArn"]
+
+        resp = sfn_sync.start_sync_execution(
+            stateMachineArn=sm_arn,
+            input=json.dumps({}),
+        )
+        assert resp["status"] == "FAILED"
+        assert resp.get("error") == "Rds.RdsException"
+    finally:
+        if sm_arn:
+            sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+        try:
+            west_rds.delete_db_cluster(
+                DBClusterIdentifier=cluster_id,
+                SkipFinalSnapshot=True,
+            )
+        except ClientError:
+            pass
 
 
 def test_sfn_aws_sdk_rds_global_not_found_error_uses_aws_name(sfn, sfn_sync):
