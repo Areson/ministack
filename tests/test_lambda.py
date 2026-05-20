@@ -181,7 +181,7 @@ def test_lambda_download_urls_preserve_resource_region():
         Description="west-layer",
         Content={"ZipFile": west_layer.getvalue()},
     )
-    west_by_arn = east.get_layer_version_by_arn(Arn=west_layer_resp["LayerVersionArn"])
+    west_by_arn = west.get_layer_version_by_arn(Arn=west_layer_resp["LayerVersionArn"])
     assert west_by_arn["Description"] == "west-layer"
 
     west_layer_zip = urllib.request.urlopen(
@@ -189,6 +189,17 @@ def test_lambda_download_urls_preserve_resource_region():
     ).read()
     with zipfile.ZipFile(io.BytesIO(west_layer_zip)) as zf:
         assert zf.read("layer.txt").decode() == "west-layer"
+
+    with pytest.raises(ClientError) as exc:
+        east.get_layer_version_by_arn(Arn=west_layer_resp["LayerVersionArn"])
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+    arn_parts = west_layer_resp["LayerVersionArn"].split(":")
+    arn_parts[4] = "111111111111" if arn_parts[4] != "111111111111" else "222222222222"
+    bogus_account_arn = ":".join(arn_parts)
+    with pytest.raises(ClientError) as exc:
+        west.get_layer_version_by_arn(Arn=bogus_account_arn)
+    assert exc.value.response["Error"]["Code"] == "AccessDeniedException"
 
 
 def test_lambda_versions_aliases_and_urls_are_region_scoped():

@@ -3760,14 +3760,21 @@ def _get_layer_version_by_arn(arn: str):
             "arn:(aws[a-zA-Z-]*)?:lambda:[a-z]{2}((-gov)|(-iso([a-z]?)))?-[a-z]+-\\d{{1}}:\\d{{12}}:layer:[a-zA-Z0-9-_]+:[0-9]+",
             400,
         )
+    if spec.account_id != get_account_id():
+        return error_response_json(
+            "AccessDeniedException",
+            "User is not authorized to access this resource.",
+            403,
+        )
+    if spec.region != get_region():
+        return error_response_json(
+            "ResourceNotFoundException",
+            "The resource you requested does not exist.",
+            404,
+        )
     layer_name = parts[1]
     version = int(parts[2])
-    return _get_layer_version(
-        layer_name,
-        version,
-        account_id=spec.account_id,
-        region=spec.region,
-    )
+    return _get_layer_version(layer_name, version)
 
 
 def _delete_layer_version(layer_name: str, version: int):
