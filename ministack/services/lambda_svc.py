@@ -1774,13 +1774,22 @@ def _schedule_state_transition(func_name: str, delay: float) -> None:
         fn = _functions.get(func_name)
         if not fn:
             return
-        cfg = fn.get("config", {})
-        cfg["State"] = "Active"
-        cfg["StateReason"] = ""
-        cfg["StateReasonCode"] = ""
-        cfg["LastUpdateStatus"] = "Successful"
-        cfg["LastUpdateStatusReason"] = ""
-        cfg["LastUpdateStatusReasonCode"] = ""
+        configs = [fn.get("config", {})]
+        configs.extend(ver.get("config", {}) for ver in fn.get("versions", {}).values())
+        for cfg in configs:
+            if not cfg:
+                continue
+            if (
+                cfg.get("State") not in (None, "", "Pending")
+                and cfg.get("LastUpdateStatus") not in (None, "", "InProgress")
+            ):
+                continue
+            cfg["State"] = "Active"
+            cfg["StateReason"] = ""
+            cfg["StateReasonCode"] = ""
+            cfg["LastUpdateStatus"] = "Successful"
+            cfg["LastUpdateStatusReason"] = ""
+            cfg["LastUpdateStatusReasonCode"] = ""
 
     ctx_snapshot = contextvars.copy_context()
     threading.Thread(target=ctx_snapshot.run, args=(_flip,), daemon=True).start()

@@ -905,6 +905,36 @@ def test_lambda_publish_version_with_create(lam):
     versions = [v["Version"] for v in resp["Versions"]]
     assert any(v != "$LATEST" for v in versions)
 
+def test_lambda_published_version_becomes_active_for_waiters(lam):
+    name = f"lam-version-ready-{_uuid_mod.uuid4().hex}"
+    resp = lam.create_function(
+        FunctionName=name,
+        Runtime="python3.11",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip("def handler(event, context): return {'ver': 1}")},
+        Publish=True,
+    )
+    version = resp["Version"]
+    lam.create_alias(FunctionName=name, Name="live", FunctionVersion=version)
+
+    deadline = time.time() + 3
+    last = None
+    while time.time() < deadline:
+        cfg = lam.get_function_configuration(FunctionName=name, Qualifier=version)
+        alias_cfg = lam.get_function_configuration(FunctionName=name, Qualifier="live")
+        last = (cfg, alias_cfg)
+        if (
+            cfg["State"] == "Active"
+            and cfg["LastUpdateStatus"] == "Successful"
+            and alias_cfg["State"] == "Active"
+            and alias_cfg["LastUpdateStatus"] == "Successful"
+        ):
+            return
+        time.sleep(0.05)
+
+    pytest.fail(f"published version did not become active: {last!r}")
+
 def test_lambda_update_code_publish_version(lam):
     # Ensure function exists (may have been cleaned up)
     try:
