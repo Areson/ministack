@@ -1446,8 +1446,7 @@ def _invoke_resource(resource, input_data):
     if "states:::lambda:invoke" in resource:
         func_name = input_data.get("FunctionName", "")
         payload = input_data.get("Payload", input_data)
-        if ":function:" in func_name:
-            func_name = func_name.split(":function:")[-1].split(":")[0]
+        func_name = _resolve_lambda_function_name(func_name, optimized=True)
         result = _call_lambda(func_name, payload)
         return {"StatusCode": 200, "Payload": result}
 
@@ -1519,8 +1518,7 @@ def _invoke_with_callback(resource, input_data, token, state_def):
     func_name = _extract_lambda_name(clean_resource)
     if not func_name and "states:::lambda:invoke" in clean_resource:
         func_name = input_data.get("FunctionName", "")
-        if ":function:" in func_name:
-            func_name = func_name.split(":function:")[-1].split(":")[0]
+        func_name = _resolve_lambda_function_name(func_name, optimized=True)
 
     if func_name:
         try:
@@ -2779,16 +2777,55 @@ def _extract_lambda_name(resource):
     if not resource:
         return None
     if ":function:" in resource:
-        try:
-            spec = parse_arn(resource)
-        except ArnParseError:
-            return resource.split(":function:")[-1].split(":")[0]
-        if spec.service == "lambda":
-            parts = spec.resource.split(":", 2)
-            if len(parts) >= 2 and parts[0] == "function":
-                return parts[1]
-        return resource.split(":function:")[-1].split(":")[0]
+        return _resolve_lambda_function_name(resource, optimized=False)
     return None
+
+
+def _resolve_lambda_function_name(value, optimized):
+    if not value:
+        return value
+    if not isinstance(value, str):
+        return value
+    if ":function:" not in value:
+        return value
+
+    fallback = value.split(":function:")[-1].split(":")[0]
+    try:
+        spec = parse_arn(value)
+    except ArnParseError:
+        return fallback
+    if spec.service != "lambda":
+        return fallback
+
+    parts = spec.resource.split(":", 2)
+    if len(parts) < 2 or parts[0] != "function":
+        return fallback
+
+    if spec.account_id != get_account_id():
+        if optimized:
+            raise _ExecutionError(
+                "Lambda.AWSLambdaException",
+                f"User is not authorized to access function {value}",
+            )
+        raise _ExecutionError(
+            "States.Runtime",
+            f"The resource '{value}' belongs to a different account. "
+            f"Expected '{get_account_id()}', was '{spec.account_id}'.",
+        )
+
+    if spec.region != get_region():
+        if optimized:
+            raise _ExecutionError(
+                "Lambda.ResourceNotFoundException",
+                f"Functions from '{spec.region}' are not reachable in this region ('{get_region()}')",
+            )
+        raise _ExecutionError(
+            "States.Runtime",
+            f"The resource '{value}' belongs to a different region. "
+            f"Expected '{get_region()}', was '{spec.region}'.",
+        )
+
+    return parts[1]
 
 
 def _next_or_end(state_def):

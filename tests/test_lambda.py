@@ -135,6 +135,62 @@ def test_lambda_full_function_arn_must_match_request_region():
     assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
 
 
+def test_lambda_download_urls_preserve_resource_region():
+    import urllib.request
+
+    east = _regional_client("lambda", "us-east-1")
+    west = _regional_client("lambda", "us-west-2")
+    name = f"lambda-download-scope-{_uuid_mod.uuid4().hex}"
+    layer_name = f"layer-download-scope-{_uuid_mod.uuid4().hex}"
+
+    east.create_function(
+        FunctionName=name,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _region_marker_code("east")},
+    )
+    west.create_function(
+        FunctionName=name,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _region_marker_code("west")},
+    )
+
+    west_code = urllib.request.urlopen(
+        west.get_function(FunctionName=name)["Code"]["Location"],
+    ).read()
+    with zipfile.ZipFile(io.BytesIO(west_code)) as zf:
+        assert '"marker": "west"' in zf.read("index.py").decode()
+
+    east_layer = io.BytesIO()
+    with zipfile.ZipFile(east_layer, "w") as zf:
+        zf.writestr("layer.txt", "east-layer")
+    west_layer = io.BytesIO()
+    with zipfile.ZipFile(west_layer, "w") as zf:
+        zf.writestr("layer.txt", "west-layer")
+
+    east.publish_layer_version(
+        LayerName=layer_name,
+        Description="east-layer",
+        Content={"ZipFile": east_layer.getvalue()},
+    )
+    west_layer_resp = west.publish_layer_version(
+        LayerName=layer_name,
+        Description="west-layer",
+        Content={"ZipFile": west_layer.getvalue()},
+    )
+    west_by_arn = east.get_layer_version_by_arn(Arn=west_layer_resp["LayerVersionArn"])
+    assert west_by_arn["Description"] == "west-layer"
+
+    west_layer_zip = urllib.request.urlopen(
+        west_by_arn["Content"]["Location"],
+    ).read()
+    with zipfile.ZipFile(io.BytesIO(west_layer_zip)) as zf:
+        assert zf.read("layer.txt").decode() == "west-layer"
+
+
 def test_lambda_versions_aliases_and_urls_are_region_scoped():
     east = _regional_client("lambda", "us-east-1")
     west = _regional_client("lambda", "us-west-2")
@@ -243,6 +299,91 @@ def test_sfn_lambda_invoke_uses_execution_region():
     assert west_desc["status"] == "SUCCEEDED"
     assert json.loads(east_desc["output"])["Payload"]["marker"] == "east"
     assert json.loads(west_desc["output"])["Payload"]["marker"] == "west"
+
+
+def test_sfn_lambda_arns_reject_foreign_region_and_account():
+    east_lam = _regional_client("lambda", "us-east-1")
+    west_lam = _regional_client("lambda", "us-west-2")
+    east_sfn = _regional_client("stepfunctions", "us-east-1")
+    name = f"lambda-sfn-scope-{_uuid_mod.uuid4().hex}"
+
+    east = east_lam.create_function(
+        FunctionName=name,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _region_marker_code("east")},
+    )
+    west = west_lam.create_function(
+        FunctionName=name,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _region_marker_code("west")},
+    )
+    bogus_account_arn = east["FunctionArn"].replace(":000000000000:", ":111111111111:")
+
+    def _optimized_definition(function_arn):
+        return json.dumps(
+            {
+                "StartAt": "Invoke",
+                "States": {
+                    "Invoke": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::lambda:invoke",
+                        "Parameters": {
+                            "FunctionName": function_arn,
+                            "Payload": {"hello": "scope"},
+                        },
+                        "End": True,
+                    }
+                },
+            }
+        )
+
+    def _direct_definition(function_arn):
+        return json.dumps(
+            {
+                "StartAt": "Invoke",
+                "States": {
+                    "Invoke": {
+                        "Type": "Task",
+                        "Resource": function_arn,
+                        "End": True,
+                    }
+                },
+            }
+        )
+
+    def _run(case, definition):
+        sm = east_sfn.create_state_machine(
+            name=f"{name}-{case}",
+            definition=definition,
+            roleArn="arn:aws:iam::000000000000:role/R",
+        )
+        ex = east_sfn.start_execution(stateMachineArn=sm["stateMachineArn"], input="{}")
+        for _ in range(50):
+            time.sleep(0.1)
+            desc = east_sfn.describe_execution(executionArn=ex["executionArn"])
+            if desc["status"] != "RUNNING":
+                return desc
+        return desc
+
+    optimized_region = _run("opt-region", _optimized_definition(west["FunctionArn"]))
+    assert optimized_region["status"] == "FAILED"
+    assert optimized_region["error"] == "Lambda.ResourceNotFoundException"
+
+    optimized_account = _run("opt-account", _optimized_definition(bogus_account_arn))
+    assert optimized_account["status"] == "FAILED"
+    assert optimized_account["error"] == "Lambda.AWSLambdaException"
+
+    direct_region = _run("direct-region", _direct_definition(west["FunctionArn"]))
+    assert direct_region["status"] == "FAILED"
+    assert direct_region["error"] == "States.Runtime"
+
+    direct_account = _run("direct-account", _direct_definition(bogus_account_arn))
+    assert direct_account["status"] == "FAILED"
+    assert direct_account["error"] == "States.Runtime"
 
 
 def test_lambda_create_invoke(lam):

@@ -2142,7 +2142,7 @@ def test_sfn_integration_lambda_invoke(sfn, lam):
 def test_sfn_extract_lambda_name_uses_resource_tail():
     from ministack.services.stepfunctions import _extract_lambda_name
 
-    arn = "arn:aws:lambda:us-east-1:123456789012:function:my-func:live"
+    arn = "arn:aws:lambda:us-east-1:000000000000:function:my-func:live"
 
     assert _extract_lambda_name(arn) == "my-func"
 
