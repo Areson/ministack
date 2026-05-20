@@ -261,7 +261,7 @@ def restore_state(data):
         _function_urls.update(data.get("function_urls", {}))
         _kinesis_positions.update(data.get("kinesis_positions", {}))
         _dynamodb_stream_positions.update(data.get("dynamodb_stream_positions", {}))
-        if _esms:
+        if _esms.has_any():
             _ensure_poller()
 
 
@@ -441,7 +441,7 @@ process.stdin.on('end', async () => {
 
 
 def _resolve_name(name_or_arn: str) -> str:
-    """Extract plain function name from a name, partial ARN, or full ARN."""
+    """Extract plain function name from a name, partial ARN, or in-scope full ARN."""
     if not name_or_arn:
         return ""
     if name_or_arn.startswith("arn:"):
@@ -453,13 +453,16 @@ def _resolve_name(name_or_arn: str) -> str:
 
 
 def _resolve_name_and_qualifier(name_or_arn: str) -> tuple[str, str | None]:
-    """Extract (function_name, qualifier) from a name, partial ARN, or full ARN.
+    """Extract (function_name, qualifier) from a name, partial ARN, or in-scope full ARN.
 
     Handles:
       my-function                -> ("my-function", None)
       my-function:v1             -> ("my-function", "v1")
       arn:...:function:my-func   -> ("my-func", None)
       arn:...:function:my-func:3 -> ("my-func", "3")
+
+    Out-of-scope full ARNs stay unresolved so they cannot accidentally target a
+    same-named function in the caller's current account/region.
     """
     if not name_or_arn:
         return "", None
@@ -478,6 +481,9 @@ def _lambda_function_name_and_qualifier_from_arn(value: str) -> tuple[str, str |
     except ArnParseError:
         return "", None
     if spec.service != "lambda":
+        return "", None
+    # Do not collapse a foreign ARN to a bare name in the caller's current scope.
+    if spec.account_id != get_account_id() or spec.region != get_region():
         return "", None
     parts = spec.resource.split(":", 2)
     if len(parts) < 2 or parts[0] != "function" or not parts[1]:
@@ -4197,7 +4203,7 @@ def _poll_loop():
             _poll_dynamodb_streams()
         except Exception as e:
             logger.error("ESM DynamoDB streams poller error: %s", e)
-        time.sleep(1 if _esms else 5)
+        time.sleep(1 if _esms.has_any() else 5)
 
 
 def _iter_all_esms():

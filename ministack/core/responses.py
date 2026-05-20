@@ -271,6 +271,9 @@ class AccountRegionScopedDict:
     def all_items(self):
         return list(self._data.items())
 
+    def has_any(self):
+        return bool(self._data)
+
     def update(self, other):
         if isinstance(other, AccountRegionScopedDict):
             self._data.update(other._data)

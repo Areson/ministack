@@ -107,6 +107,34 @@ def test_lambda_functions_are_region_scoped():
     assert ":us-west-2:" in west_payload["arn"]
 
 
+def test_lambda_full_function_arn_must_match_request_region():
+    east = _regional_client("lambda", "us-east-1")
+    west = _regional_client("lambda", "us-west-2")
+    name = f"lambda-arn-scope-{_uuid_mod.uuid4().hex}"
+
+    east_created = east.create_function(
+        FunctionName=name,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _region_marker_code("east")},
+    )
+    west_created = west.create_function(
+        FunctionName=name,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _region_marker_code("west")},
+    )
+
+    same_region = east.get_function(FunctionName=east_created["FunctionArn"])
+    assert same_region["Configuration"]["FunctionArn"] == east_created["FunctionArn"]
+
+    with pytest.raises(ClientError) as exc:
+        east.get_function(FunctionName=west_created["FunctionArn"])
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
 def test_lambda_versions_aliases_and_urls_are_region_scoped():
     east = _regional_client("lambda", "us-east-1")
     west = _regional_client("lambda", "us-west-2")
@@ -2585,7 +2613,7 @@ from unittest.mock import MagicMock
 import pytest
 
 import ministack.services.lambda_svc as lsvc
-from ministack.core.responses import set_request_account_id
+from ministack.core.responses import get_account_id, get_region, set_request_account_id, set_request_region
 
 
 @pytest.fixture(autouse=True)
@@ -3621,8 +3649,48 @@ def test_lambda_resolve_name_and_qualifier_uses_resource_tail():
 
     arn = "arn:aws:lambda:us-east-1:123456789012:function:my-func:live"
 
-    assert _resolve_name(arn) == "my-func"
-    assert _resolve_name_and_qualifier(arn) == ("my-func", "live")
+    original_account = get_account_id()
+    original_region = get_region()
+    try:
+        set_request_account_id("123456789012")
+        set_request_region("us-east-1")
+
+        assert _resolve_name(arn) == "my-func"
+        assert _resolve_name_and_qualifier(arn) == ("my-func", "live")
+    finally:
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_lambda_restore_state_starts_poller_for_non_default_scoped_esms(monkeypatch):
+    from ministack.core.responses import AccountRegionScopedDict
+
+    original_account = get_account_id()
+    original_region = get_region()
+    original_esms = dict(lsvc._esms._data)
+    calls = []
+
+    try:
+        lsvc._esms.clear()
+        restored_esms = AccountRegionScopedDict()
+        restored_esms.set_scoped(
+            "111111111111",
+            "us-west-2",
+            "esm-1",
+            {"UUID": "esm-1", "FunctionName": "fn", "Enabled": True},
+        )
+        monkeypatch.setattr(lsvc, "_ensure_poller", lambda: calls.append("started"))
+
+        set_request_account_id("000000000000")
+        set_request_region("us-east-1")
+        lsvc.restore_state({"esms": restored_esms})
+
+        assert calls == ["started"]
+    finally:
+        lsvc._esms.clear()
+        lsvc._esms._data.update(original_esms)
+        set_request_account_id(original_account)
+        set_request_region(original_region)
 
 
 def _run_nodejs_worker(handler_js, event_payload=None, env_extra=None):
