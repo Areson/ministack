@@ -10,6 +10,13 @@ import pytest
 from botocore.exceptions import ClientError
 from conftest import make_client
 
+from ministack.core.responses import (
+    get_account_id,
+    get_region,
+    set_request_account_id,
+    set_request_region,
+)
+
 
 def _make_zip(code: str) -> bytes:
     buf = io.BytesIO()
@@ -2144,7 +2151,16 @@ def test_sfn_extract_lambda_name_uses_resource_tail():
 
     arn = "arn:aws:lambda:us-east-1:000000000000:function:my-func:live"
 
-    assert _extract_lambda_name(arn) == "my-func"
+    original_account = get_account_id()
+    original_region = get_region()
+    try:
+        set_request_account_id("000000000000")
+        set_request_region("us-east-1")
+
+        assert _extract_lambda_name(arn) == "my-func"
+    finally:
+        set_request_account_id(original_account)
+        set_request_region(original_region)
 
 
 def test_sfn_choice_state(sfn):

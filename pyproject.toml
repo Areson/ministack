@@ -22,6 +22,7 @@ classifiers = [
     "Topic :: Internet",
 ]
 dependencies = [
+    "cbor2>=5.4.0",
     "hypercorn>=0.18.0",
     "pyyaml>=6.0",
     "defusedxml>=0.7",
