@@ -3331,6 +3331,8 @@ def _resolve_layer_zip(layer_arn_str: str) -> bytes | None:
         return None
     if spec.account_id != get_account_id():
         return None
+    if spec.region != get_region():
+        return None
     parts = spec.resource.split(":", 2)
     if len(parts) != 3 or parts[0] != "layer":
         return None

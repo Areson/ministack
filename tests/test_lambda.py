@@ -4090,6 +4090,31 @@ def test_lambda_layer_zip_rejects_foreign_account_arn():
         set_request_region(original_region)
 
 
+def test_lambda_layer_zip_rejects_foreign_region_arn():
+    original_account = get_account_id()
+    original_region = get_region()
+    original_layers = dict(lsvc._layers._data)
+    west_layer_arn = "arn:aws:lambda:us-west-2:000000000000:layer:west-layer:1"
+
+    try:
+        lsvc._layers.clear()
+        lsvc._layers.set_scoped(
+            "000000000000",
+            "us-west-2",
+            "west-layer",
+            {"versions": [{"Version": 1, "_zip_data": b"west"}]},
+        )
+        set_request_account_id("000000000000")
+        set_request_region("us-east-1")
+
+        assert lsvc._resolve_layer_zip(west_layer_arn) is None
+    finally:
+        lsvc._layers.clear()
+        lsvc._layers._data.update(original_layers)
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
 def test_lambda_create_esm_rejects_unresolved_function_arn():
     original_account = get_account_id()
     original_region = get_region()
