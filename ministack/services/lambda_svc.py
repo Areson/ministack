@@ -259,8 +259,8 @@ def restore_state(data):
         _layers.update(data.get("layers", {}))
         _esms.update(data.get("esms", {}))
         _function_urls.update(data.get("function_urls", {}))
-        _kinesis_positions.update(data.get("kinesis_positions", {}))
-        _dynamodb_stream_positions.update(data.get("dynamodb_stream_positions", {}))
+        _restore_esm_positions(_kinesis_positions, data.get("kinesis_positions", {}))
+        _restore_esm_positions(_dynamodb_stream_positions, data.get("dynamodb_stream_positions", {}))
         if _esms.has_any():
             _ensure_poller()
 
@@ -274,6 +274,36 @@ def _region_from_function_record(func: dict) -> str:
         except ArnParseError:
             pass
     return get_region()
+
+
+def _restore_esm_positions(store: AccountRegionScopedDict, positions) -> None:
+    if isinstance(positions, AccountRegionScopedDict):
+        store.update(positions)
+        return
+
+    esm_scopes = {
+        (account_id, esm_id): region
+        for (account_id, region, esm_id) in _esms._data
+    }
+
+    if isinstance(positions, AccountScopedDict):
+        for (account_id, esm_id), value in positions._data.items():
+            region = esm_scopes.get((account_id, esm_id), get_region())
+            store._data[(account_id, region, esm_id)] = value
+        return
+
+    if isinstance(positions, dict):
+        for key, value in positions.items():
+            if isinstance(key, tuple) and len(key) == 3:
+                store._data[key] = value
+            elif isinstance(key, tuple) and len(key) == 2:
+                account_id, esm_id = key
+                region = esm_scopes.get((account_id, esm_id), get_region())
+                store._data[(account_id, region, esm_id)] = value
+            else:
+                account_id = get_account_id()
+                region = esm_scopes.get((account_id, key), get_region())
+                store._data[(account_id, region, key)] = value
 
 
 # NOTE: the persisted-state load used to run here, but ``restore_state`` calls

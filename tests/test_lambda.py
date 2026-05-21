@@ -4086,6 +4086,69 @@ def test_lambda_restore_state_starts_poller_for_non_default_scoped_esms(monkeypa
         set_request_region(original_region)
 
 
+def test_lambda_restore_legacy_esm_offsets_uses_restored_esm_region(monkeypatch):
+    from ministack.core.responses import AccountScopedDict
+
+    original_account = get_account_id()
+    original_region = get_region()
+    original_esms = dict(lsvc._esms._data)
+    original_kinesis_positions = dict(lsvc._kinesis_positions._data)
+    original_ddb_positions = dict(lsvc._dynamodb_stream_positions._data)
+
+    try:
+        lsvc._esms.clear()
+        lsvc._kinesis_positions.clear()
+        lsvc._dynamodb_stream_positions.clear()
+        monkeypatch.setattr(lsvc, "_ensure_poller", lambda: None)
+
+        legacy_esms = AccountScopedDict()
+        legacy_esms._data[("111111111111", "esm-west")] = {
+            "UUID": "esm-west",
+            "FunctionArn": "arn:aws:lambda:us-west-2:111111111111:function:fn",
+            "FunctionName": "fn",
+            "EventSourceArn": "arn:aws:kinesis:us-west-2:111111111111:stream/source",
+            "Enabled": True,
+            "StartingPosition": "TRIM_HORIZON",
+        }
+        legacy_kinesis_positions = AccountScopedDict()
+        legacy_kinesis_positions._data[("111111111111", "esm-west")] = {
+            "shardId-000000000000": 7,
+        }
+        legacy_ddb_positions = AccountScopedDict()
+        legacy_ddb_positions._data[("111111111111", "esm-west")] = 11
+
+        set_request_account_id("111111111111")
+        set_request_region("us-east-1")
+        lsvc.restore_state({
+            "esms": legacy_esms,
+            "kinesis_positions": legacy_kinesis_positions,
+            "dynamodb_stream_positions": legacy_ddb_positions,
+        })
+
+        assert lsvc._esms.get_scoped("111111111111", "us-west-2", "esm-west")
+        assert lsvc._kinesis_positions.get_scoped(
+            "111111111111",
+            "us-west-2",
+            "esm-west",
+        ) == {"shardId-000000000000": 7}
+        assert lsvc._dynamodb_stream_positions.get_scoped(
+            "111111111111",
+            "us-west-2",
+            "esm-west",
+        ) == 11
+        assert lsvc._kinesis_positions.get_scoped("111111111111", "us-east-1", "esm-west") is None
+        assert lsvc._dynamodb_stream_positions.get_scoped("111111111111", "us-east-1", "esm-west") is None
+    finally:
+        lsvc._esms.clear()
+        lsvc._esms._data.update(original_esms)
+        lsvc._kinesis_positions.clear()
+        lsvc._kinesis_positions._data.update(original_kinesis_positions)
+        lsvc._dynamodb_stream_positions.clear()
+        lsvc._dynamodb_stream_positions._data.update(original_ddb_positions)
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
 def _run_nodejs_worker(handler_js, event_payload=None, env_extra=None):
     """Spin up a Node.js Lambda worker with the given handler, return invoke result."""
     import io
