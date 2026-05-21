@@ -444,6 +444,13 @@ def _global_cluster_member(cluster, is_writer):
     }
 
 
+def _refresh_global_cluster_readers(global_cluster):
+    members = global_cluster.get("GlobalClusterMembers", [])
+    reader_arns = [m["DBClusterArn"] for m in members if not m.get("IsWriter")]
+    for member in members:
+        member["Readers"] = reader_arns if member.get("IsWriter") else []
+
+
 def _attach_cluster_to_global(global_cluster, cluster, is_writer):
     members = [
         m for m in global_cluster.setdefault("GlobalClusterMembers", [])
@@ -451,6 +458,7 @@ def _attach_cluster_to_global(global_cluster, cluster, is_writer):
     ]
     members.append(_global_cluster_member(cluster, is_writer))
     global_cluster["GlobalClusterMembers"] = members
+    _refresh_global_cluster_readers(global_cluster)
     cluster["GlobalClusterIdentifier"] = global_cluster["GlobalClusterIdentifier"]
     cluster["GlobalWriteForwardingStatus"] = "disabled"
 
@@ -1864,6 +1872,18 @@ def _describe_db_cluster_snapshots(p):
     else:
         snaps = list(_db_cluster_snapshots.values())
         if cluster_id:
+            wrong_region = _invalid_region_arn_error(cluster_id, "DBClusterIdentifier")
+            if wrong_region:
+                return wrong_region
+            parsed = _parse_rds_arn(cluster_id)
+            if parsed:
+                spec, resource_type, resource_id = parsed
+                if (
+                    resource_type == "cluster"
+                    and spec.account_id == get_account_id()
+                    and spec.region == get_region()
+                ):
+                    cluster_id = resource_id
             snaps = [s for s in snaps if s["DBClusterIdentifier"] == cluster_id]
         if snap_type:
             snaps = [s for s in snaps if s["SnapshotType"] == snap_type]
@@ -2250,6 +2270,7 @@ def _remove_from_global_cluster(p):
 
     new_members = [m for m in members if m["DBClusterArn"] != db_cluster_arn]
     gc["GlobalClusterMembers"] = new_members
+    _refresh_global_cluster_readers(gc)
     if not cluster:
         cluster = _resolve_cluster(db_cluster_arn)
     if cluster:
@@ -2310,6 +2331,7 @@ def _enable_http_endpoint(p):
 
 
 def _global_cluster_xml(gc):
+    _refresh_global_cluster_readers(gc)
     member_xml = ""
     for m in gc.get("GlobalClusterMembers", []):
         readers_xml = "".join(f"<member>{_esc(reader)}</member>" for reader in m.get("Readers", []))

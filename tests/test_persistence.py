@@ -104,6 +104,30 @@ def test_account_region_scoped_dict_migrates_legacy_values_to_arn_region():
         set_request_region(original_region)
 
 
+def test_account_scoped_dict_helpers_remain_account_only():
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        set_request_account_id,
+    )
+
+    original_account = get_account_id()
+
+    try:
+        store = AccountScopedDict()
+        store.set_scoped("111111111111", "us-west-2", "same-name", {"value": "helper"})
+        set_request_account_id("111111111111")
+
+        assert store["same-name"] == {"value": "helper"}
+        store["normal"] = {"value": "normal"}
+        assert store.get_scoped("111111111111", "us-east-1", "normal") == {"value": "normal"}
+        assert store.contains_scoped("111111111111", "us-west-2", "normal")
+        assert store.pop_scoped("111111111111", "us-west-2", "normal") == {"value": "normal"}
+        assert "normal" not in store
+    finally:
+        set_request_account_id(original_account)
+
+
 def test_rds_restore_legacy_account_scoped_instances_uses_instance_arn_region():
     from ministack.core.responses import (
         AccountScopedDict,
