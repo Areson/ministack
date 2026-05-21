@@ -2201,6 +2201,105 @@ def test_sfn_extract_lambda_name_uses_resource_tail():
         set_request_region(original_region)
 
 
+def test_sfn_direct_lambda_arn_preserves_qualifier(monkeypatch):
+    from ministack.services import lambda_svc as lsvc
+    from ministack.services import stepfunctions as sfn_m
+
+    original_account = get_account_id()
+    original_region = get_region()
+    original_functions = dict(lsvc._functions._data)
+    base_arn = "arn:aws:lambda:us-east-1:000000000000:function:sfn-qualified-fn"
+    version_arn = f"{base_arn}:1"
+    seen = {}
+
+    def _capture(exec_record, event):
+        seen["arn"] = exec_record["config"]["FunctionArn"]
+        seen["event"] = event
+        return {"body": {"selected": exec_record["config"]["FunctionArn"]}}
+
+    try:
+        lsvc._functions.clear()
+        lsvc._functions.set_scoped(
+            "000000000000",
+            "us-east-1",
+            "sfn-qualified-fn",
+            {
+                "config": {
+                    "FunctionName": "sfn-qualified-fn",
+                    "FunctionArn": base_arn,
+                },
+                "versions": {
+                    "1": {
+                        "config": {
+                            "FunctionName": "sfn-qualified-fn",
+                            "FunctionArn": version_arn,
+                            "Version": "1",
+                        },
+                    },
+                },
+                "aliases": {"live": {"FunctionVersion": "1"}},
+            },
+        )
+        monkeypatch.setattr(lsvc, "_execute_function_with_config_scope", _capture)
+        set_request_account_id("000000000000")
+        set_request_region("us-east-1")
+
+        result = sfn_m._invoke_resource(f"{base_arn}:live", {"hello": "world"})
+
+        assert seen == {"arn": version_arn, "event": {"hello": "world"}}
+        assert result == {"selected": version_arn}
+    finally:
+        lsvc._functions.clear()
+        lsvc._functions._data.update(original_functions)
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_sfn_malformed_lambda_arn_does_not_fallback_to_name():
+    from ministack.services import lambda_svc as lsvc
+    from ministack.services import stepfunctions as sfn_m
+
+    original_account = get_account_id()
+    original_region = get_region()
+    original_functions = dict(lsvc._functions._data)
+    malformed_arn = "arn:aws:lambda:function:sfn-malformed-fallback"
+
+    try:
+        lsvc._functions.clear()
+        lsvc._functions.set_scoped(
+            "000000000000",
+            "us-east-1",
+            "sfn-malformed-fallback",
+            {
+                "config": {
+                    "FunctionName": "sfn-malformed-fallback",
+                    "FunctionArn": (
+                        "arn:aws:lambda:us-east-1:000000000000:function:sfn-malformed-fallback"
+                    ),
+                },
+                "versions": {},
+            },
+        )
+        set_request_account_id("000000000000")
+        set_request_region("us-east-1")
+
+        with pytest.raises(sfn_m._ExecutionError) as direct_exc:
+            sfn_m._invoke_resource(malformed_arn, {})
+        assert direct_exc.value.error == "States.Runtime"
+
+        with pytest.raises(sfn_m._ExecutionError) as optimized_exc:
+            sfn_m._invoke_resource(
+                "arn:aws:states:::lambda:invoke",
+                {"FunctionName": malformed_arn, "Payload": {}},
+            )
+        assert optimized_exc.value.error == "Lambda.ResourceNotFoundException"
+    finally:
+        lsvc._functions.clear()
+        lsvc._functions._data.update(original_functions)
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
 def test_sfn_choice_state(sfn):
     """Choice state routes to correct branch based on input."""
     definition = json.dumps(
