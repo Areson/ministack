@@ -4239,13 +4239,26 @@ def _esm_response(esm: dict) -> dict:
     return {k: v for k, v in esm.items() if k not in ("FunctionName", "Enabled")}
 
 
+def _resolve_existing_esm_function(function_ref: str):
+    func_name, qualifier = _resolve_request_scoped_name_and_qualifier(function_ref)
+    if not func_name or func_name not in _functions:
+        return None, None, error_response_json(
+            "ResourceNotFoundException",
+            f"Function not found: {function_ref}",
+            404,
+        )
+    return func_name, qualifier, None
+
+
 def _create_esm(data: dict):
     esm_id = new_uuid()
     # Preserve the alias/version qualifier if the caller supplied one so
     # poller invocations route to the correct target (#407).
-    func_name, qualifier = _resolve_request_scoped_name_and_qualifier(
+    func_name, qualifier, err = _resolve_existing_esm_function(
         data.get("FunctionName", ""),
     )
+    if err:
+        return err
     event_source_arn = data.get("EventSourceArn", "")
 
     enabled = data.get("Enabled", True)
@@ -4340,9 +4353,12 @@ def _update_esm(esm_id: str, data: dict):
         esm["Enabled"] = data["Enabled"]
         esm["State"] = "Enabled" if data["Enabled"] else "Disabled"
     if "FunctionName" in data:
-        new_name = _resolve_request_scoped_name(data["FunctionName"])
+        new_name, qualifier, err = _resolve_existing_esm_function(data["FunctionName"])
+        if err:
+            return err
         esm["FunctionName"] = new_name
-        esm["FunctionArn"] = _func_arn(new_name)
+        esm["Qualifier"] = qualifier
+        esm["FunctionArn"] = _func_arn(new_name) + (f":{qualifier}" if qualifier else "")
     esm["LastModified"] = int(time.time())
     return json_response(_esm_response(esm))
 

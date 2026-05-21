@@ -4055,6 +4055,92 @@ def test_lambda_layer_zip_rejects_foreign_account_arn():
         set_request_region(original_region)
 
 
+def test_lambda_create_esm_rejects_unresolved_function_arn():
+    original_account = get_account_id()
+    original_region = get_region()
+    original_functions = dict(lsvc._functions._data)
+    original_esms = dict(lsvc._esms._data)
+    west_arn = "arn:aws:lambda:us-west-2:000000000000:function:esm-west-fn"
+
+    try:
+        lsvc._functions.clear()
+        lsvc._esms.clear()
+        lsvc._functions.set_scoped(
+            "000000000000",
+            "us-west-2",
+            "esm-west-fn",
+            {"config": {"FunctionName": "esm-west-fn", "FunctionArn": west_arn}, "versions": {}},
+        )
+        set_request_account_id("000000000000")
+        set_request_region("us-east-1")
+
+        status, _headers, body = lsvc._create_esm({
+            "EventSourceArn": "arn:aws:sqs:us-east-1:000000000000:source",
+            "FunctionName": west_arn,
+        })
+
+        assert status == 404
+        assert json.loads(body)["__type"] == "ResourceNotFoundException"
+        assert not lsvc._esms.values()
+    finally:
+        lsvc._functions.clear()
+        lsvc._functions._data.update(original_functions)
+        lsvc._esms.clear()
+        lsvc._esms._data.update(original_esms)
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_lambda_update_esm_rejects_unresolved_function_arn():
+    original_account = get_account_id()
+    original_region = get_region()
+    original_functions = dict(lsvc._functions._data)
+    original_esms = dict(lsvc._esms._data)
+    east_arn = "arn:aws:lambda:us-east-1:000000000000:function:esm-east-fn"
+    west_arn = "arn:aws:lambda:us-west-2:000000000000:function:esm-west-fn"
+
+    try:
+        lsvc._functions.clear()
+        lsvc._esms.clear()
+        lsvc._functions.set_scoped(
+            "000000000000",
+            "us-east-1",
+            "esm-east-fn",
+            {"config": {"FunctionName": "esm-east-fn", "FunctionArn": east_arn}, "versions": {}},
+        )
+        lsvc._functions.set_scoped(
+            "000000000000",
+            "us-west-2",
+            "esm-west-fn",
+            {"config": {"FunctionName": "esm-west-fn", "FunctionArn": west_arn}, "versions": {}},
+        )
+        set_request_account_id("000000000000")
+        set_request_region("us-east-1")
+        lsvc._esms["esm-1"] = {
+            "UUID": "esm-1",
+            "EventSourceArn": "arn:aws:sqs:us-east-1:000000000000:source",
+            "FunctionArn": east_arn,
+            "FunctionName": "esm-east-fn",
+            "Qualifier": None,
+            "State": "Enabled",
+            "Enabled": True,
+        }
+
+        status, _headers, body = lsvc._update_esm("esm-1", {"FunctionName": west_arn})
+
+        assert status == 404
+        assert json.loads(body)["__type"] == "ResourceNotFoundException"
+        assert lsvc._esms["esm-1"]["FunctionArn"] == east_arn
+        assert lsvc._esms["esm-1"]["FunctionName"] == "esm-east-fn"
+    finally:
+        lsvc._functions.clear()
+        lsvc._functions._data.update(original_functions)
+        lsvc._esms.clear()
+        lsvc._esms._data.update(original_esms)
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
 def test_unsigned_dataplane_integrations_resolve_lambda_arn_region(monkeypatch):
     import asyncio
 
