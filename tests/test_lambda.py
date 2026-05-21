@@ -4030,6 +4030,41 @@ def test_lambda_target_arn_lookup_rejects_foreign_account():
         set_request_region(original_region)
 
 
+def test_lambda_target_arn_lookup_rejects_missing_qualifier():
+    original_account = get_account_id()
+    original_region = get_region()
+    original_functions = dict(lsvc._functions._data)
+    west_arn = "arn:aws:lambda:us-west-2:000000000000:function:qualified-west-fn"
+
+    try:
+        lsvc._functions.clear()
+        lsvc._functions.set_scoped(
+            "000000000000",
+            "us-west-2",
+            "qualified-west-fn",
+            {
+                "config": {
+                    "FunctionName": "qualified-west-fn",
+                    "FunctionArn": west_arn,
+                },
+                "versions": {},
+            },
+        )
+        set_request_account_id("000000000000")
+        set_request_region("us-east-1")
+
+        record, config, name = lsvc._get_func_record_for_ref(f"{west_arn}:missing")
+
+        assert name == "qualified-west-fn"
+        assert record is None
+        assert config is None
+    finally:
+        lsvc._functions.clear()
+        lsvc._functions._data.update(original_functions)
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
 def test_lambda_layer_zip_rejects_foreign_account_arn():
     original_account = get_account_id()
     original_region = get_region()

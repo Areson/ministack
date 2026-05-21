@@ -773,6 +773,14 @@ def _effective_func_record_for_qualifier(func: dict | None, qualifier: str | Non
     return func, func["config"]
 
 
+def _function_qualifier_exists(func: dict | None, qualifier: str | None) -> bool:
+    if func is None:
+        return False
+    if qualifier is None or qualifier == "$LATEST":
+        return True
+    return qualifier in func.get("aliases", {}) or qualifier in func.get("versions", {})
+
+
 def _get_func_record_for_ref(function_ref: str) -> tuple[dict | None, dict | None, str]:
     if isinstance(function_ref, str) and function_ref.startswith("arn:"):
         try:
@@ -785,6 +793,8 @@ def _get_func_record_for_ref(function_ref: str) -> tuple[dict | None, dict | Non
                 if spec.account_id != get_account_id():
                     return None, None, name
                 func = _functions.get_scoped(get_account_id(), spec.region, name)
+                if not _function_qualifier_exists(func, qualifier):
+                    return None, None, name
                 record, config = _effective_func_record_for_qualifier(func, qualifier)
                 return record, config, name
 
