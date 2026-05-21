@@ -894,9 +894,7 @@ def _deliver_to_sqs(endpoint: str, envelope: str, raw: bool, raw_message: str,
 def _deliver_to_lambda(endpoint: str, envelope: str, topic_arn: str, sub_arn: str,
                        msg_id: str, raw_message: str, message_attributes: dict):
     """Invoke a Lambda function with the SNS Records envelope (AWS format)."""
-    # endpoint is a Lambda ARN: arn:aws:lambda:region:account:function:name
-    func_name = endpoint.split(":")[-1]
-    func = _lambda_svc._functions.get(func_name)
+    func, _config, func_name = _lambda_svc._get_func_record_for_ref(endpoint)
     if not func:
         logger.warning("SNS fanout: Lambda function %s not found", func_name)
         return
@@ -911,7 +909,7 @@ def _deliver_to_lambda(endpoint: str, envelope: str, topic_arn: str, sub_arn: st
         ]
     }
     try:
-        _lambda_svc._execute_function(func, event)
+        _lambda_svc._execute_function_with_config_scope(func, event)
         logger.info("SNS fanout → Lambda %s", func_name)
     except Exception as exc:
         logger.error("SNS fanout → Lambda %s failed: %s", func_name, exc)

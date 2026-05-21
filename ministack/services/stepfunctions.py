@@ -856,7 +856,11 @@ async def _get_activity_task(data):
 def _tag_resource(data):
     arn = data.get("resourceArn")
     new_tags = data.get("tags", [])
-    existing = _tags.setdefault(arn, [])
+    account_id, region = _scope_from_resource_arn(arn)
+    existing = _tags.get_scoped(account_id, region, arn)
+    if existing is None:
+        existing = []
+        _tags.set_scoped(account_id, region, arn, existing)
     existing_map = {t["key"]: i for i, t in enumerate(existing)}
     for tag in new_tags:
         idx = existing_map.get(tag["key"])
@@ -871,14 +875,26 @@ def _tag_resource(data):
 def _untag_resource(data):
     arn = data.get("resourceArn")
     keys_to_remove = set(data.get("tagKeys", []))
-    existing = _tags.get(arn, [])
-    _tags[arn] = [t for t in existing if t["key"] not in keys_to_remove]
+    account_id, region = _scope_from_resource_arn(arn)
+    existing = _tags.get_scoped(account_id, region, arn, [])
+    _tags.set_scoped(account_id, region, arn, [t for t in existing if t["key"] not in keys_to_remove])
     return json_response({})
 
 
 def _list_tags_for_resource(data):
     arn = data.get("resourceArn")
-    return json_response({"tags": _tags.get(arn, [])})
+    account_id, region = _scope_from_resource_arn(arn)
+    return json_response({"tags": _tags.get_scoped(account_id, region, arn, [])})
+
+
+def _scope_from_resource_arn(arn):
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return get_account_id(), get_region()
+    if spec.service != "states":
+        return get_account_id(), get_region()
+    return spec.account_id or get_account_id(), spec.region or get_region()
 
 
 # ---------------------------------------------------------------------------

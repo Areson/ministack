@@ -717,7 +717,10 @@ def _get_func_record_for_qualifier(name: str, qualifier: str | None) -> tuple[di
     For a version number, returns the versioned snapshot.
     For an alias, resolves to the alias target version.
     """
-    func = _functions.get(name)
+    return _effective_func_record_for_qualifier(_functions.get(name), qualifier)
+
+
+def _effective_func_record_for_qualifier(func: dict | None, qualifier: str | None) -> tuple[dict | None, dict | None]:
     if func is None:
         return None, None
 
@@ -738,6 +741,35 @@ def _get_func_record_for_qualifier(name: str, qualifier: str | None) -> tuple[di
         return ver, ver["config"]
 
     return func, func["config"]
+
+
+def _get_func_record_for_ref(function_ref: str) -> tuple[dict | None, dict | None, str]:
+    if isinstance(function_ref, str) and function_ref.startswith("arn:"):
+        try:
+            spec = parse_arn(function_ref)
+        except ArnParseError:
+            spec = None
+        if spec and spec.service == "lambda":
+            name, qualifier = _lambda_function_name_and_qualifier_from_arn(function_ref)
+            if name:
+                func = _functions.get_scoped(spec.account_id, spec.region, name)
+                record, config = _effective_func_record_for_qualifier(func, qualifier)
+                return record, config, name
+
+    name, qualifier = _resolve_name_and_qualifier(function_ref)
+    record, config = _get_func_record_for_qualifier(name, qualifier)
+    return record, config, name
+
+
+def _execute_function_with_config_scope(func: dict, event: dict) -> dict:
+    def _run():
+        config = func.get("config") or func
+        account_id, region = _account_region_from_function_config(config)
+        _request_account_id.set(account_id)
+        _request_region.set(region)
+        return _execute_function(func, event)
+
+    return contextvars.copy_context().run(_run)
 
 
 # ---------------------------------------------------------------------------
@@ -2074,11 +2106,11 @@ def _route_async_failure(target_arn: str, func_name: str, event: dict, result: d
                 _sns._fanout(target_arn, new_uuid(), body, "Lambda async failure", "", {})
                 return
         elif ":lambda:" in target_arn:
-            dest_name = target_arn.rsplit(":", 1)[-1]
-            if dest_name in _functions:
+            dest_func, _dest_config, dest_name = _get_func_record_for_ref(target_arn)
+            if dest_func:
                 threading.Thread(
-                    target=_execute_function,
-                    args=(_functions[dest_name], envelope),
+                    target=_execute_function_with_config_scope,
+                    args=(dest_func, envelope),
                     daemon=True,
                 ).start()
                 return

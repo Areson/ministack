@@ -3936,6 +3936,65 @@ def test_lambda_async_retry_thread_uses_function_arn_region(monkeypatch):
         set_request_region(original_region)
 
 
+def test_cross_service_lambda_fanout_resolves_target_arn_region(monkeypatch):
+    from ministack.services import eventbridge as _events
+    from ministack.services import s3 as _s3
+    from ministack.services import sns as _sns
+
+    original_account = get_account_id()
+    original_region = get_region()
+    original_functions = dict(lsvc._functions._data)
+    west_arn = "arn:aws:lambda:us-west-2:000000000000:function:fanout-west-fn"
+    func = {
+        "config": {
+            "FunctionName": "fanout-west-fn",
+            "FunctionArn": west_arn,
+        },
+        "versions": {},
+    }
+    seen = []
+
+    def _capture_async(target_func, event):
+        seen.append(("async", target_func["config"]["FunctionArn"], event))
+
+    def _capture_sync(target_func, event):
+        seen.append(("sync", target_func["config"]["FunctionArn"], event))
+        return {"error": False, "body": {}}
+
+    try:
+        lsvc._functions.clear()
+        lsvc._functions.set_scoped("000000000000", "us-west-2", "fanout-west-fn", func)
+        monkeypatch.setattr(lsvc, "invoke_async_with_retry", _capture_async)
+        monkeypatch.setattr(lsvc, "_execute_function_with_config_scope", _capture_sync)
+
+        set_request_account_id("000000000000")
+        set_request_region("us-east-1")
+
+        _s3._deliver_event_to_lambda(west_arn, {"Records": [{"eventSource": "aws:s3"}]})
+        _sns._deliver_to_lambda(
+            west_arn,
+            json.dumps({"Message": "hi"}),
+            "arn:aws:sns:us-east-1:000000000000:topic",
+            "arn:aws:sns:us-east-1:000000000000:topic:sub",
+            "msg-1",
+            "hi",
+            {},
+        )
+        _events._dispatch_to_lambda(west_arn, json.dumps({"source": "test"}))
+
+        deadline = time.time() + 2
+        while len(seen) < 3 and time.time() < deadline:
+            time.sleep(0.01)
+
+        assert [entry[0] for entry in seen] == ["async", "sync", "sync"]
+        assert [entry[1] for entry in seen] == [west_arn, west_arn, west_arn]
+    finally:
+        lsvc._functions.clear()
+        lsvc._functions._data.update(original_functions)
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
 def test_lambda_restore_state_starts_poller_for_non_default_scoped_esms(monkeypatch):
     from ministack.core.responses import AccountRegionScopedDict
 

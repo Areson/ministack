@@ -381,6 +381,37 @@ def test_sfn_tags_v2(sfn):
     assert not any(t["key"] == "init" for t in tags3)
     assert any(t["key"] == "env" for t in tags3)
 
+
+def test_sfn_tags_scope_by_resource_arn_region():
+    from ministack.core.responses import get_account_id, get_region, set_request_account_id, set_request_region
+    from ministack.services import stepfunctions as m
+
+    original_account = get_account_id()
+    original_region = get_region()
+    original_tags = dict(m._tags._data)
+    arn = "arn:aws:states:us-west-2:000000000000:stateMachine:tagged-west"
+
+    try:
+        m._tags.clear()
+        set_request_account_id("000000000000")
+        set_request_region("us-east-1")
+
+        m._tag_resource({"resourceArn": arn, "tags": [{"key": "env", "value": "west"}]})
+
+        assert m._tags.get_scoped("000000000000", "us-west-2", arn) == [
+            {"key": "env", "value": "west"},
+        ]
+        assert m._tags.get_scoped("000000000000", "us-east-1", arn) is None
+
+        _status, _headers, body = m._list_tags_for_resource({"resourceArn": arn})
+        assert json.loads(body)["tags"] == [{"key": "env", "value": "west"}]
+    finally:
+        m._tags.clear()
+        m._tags._data.update(original_tags)
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
 def test_sfn_intrinsic_string_to_json(sfn, sfn_sync):
     """States.StringToJson parses a JSON string into structured data."""
     definition = json.dumps({
