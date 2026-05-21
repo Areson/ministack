@@ -405,6 +405,13 @@ def test_sfn_tags_scope_by_resource_arn_region():
 
         _status, _headers, body = m._list_tags_for_resource({"resourceArn": arn})
         assert json.loads(body)["tags"] == [{"key": "env", "value": "west"}]
+
+        foreign_arn = "arn:aws:states:us-west-2:111111111111:stateMachine:foreign"
+        m._tag_resource({"resourceArn": foreign_arn, "tags": [{"key": "owner", "value": "other"}]})
+        assert m._tags.get_scoped("111111111111", "us-west-2", foreign_arn) is None
+        assert m._tags.get_scoped("000000000000", "us-west-2", foreign_arn) == [
+            {"key": "owner", "value": "other"},
+        ]
     finally:
         m._tags.clear()
         m._tags._data.update(original_tags)

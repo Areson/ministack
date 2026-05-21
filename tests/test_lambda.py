@@ -3995,6 +3995,66 @@ def test_cross_service_lambda_fanout_resolves_target_arn_region(monkeypatch):
         set_request_region(original_region)
 
 
+def test_lambda_target_arn_lookup_rejects_foreign_account():
+    original_account = get_account_id()
+    original_region = get_region()
+    original_functions = dict(lsvc._functions._data)
+    foreign_arn = "arn:aws:lambda:us-west-2:111111111111:function:foreign-fn"
+
+    try:
+        lsvc._functions.clear()
+        lsvc._functions.set_scoped(
+            "111111111111",
+            "us-west-2",
+            "foreign-fn",
+            {
+                "config": {
+                    "FunctionName": "foreign-fn",
+                    "FunctionArn": foreign_arn,
+                },
+                "versions": {},
+            },
+        )
+        set_request_account_id("000000000000")
+        set_request_region("us-west-2")
+
+        record, config, name = lsvc._get_func_record_for_ref(foreign_arn)
+
+        assert name == "foreign-fn"
+        assert record is None
+        assert config is None
+    finally:
+        lsvc._functions.clear()
+        lsvc._functions._data.update(original_functions)
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_lambda_layer_zip_rejects_foreign_account_arn():
+    original_account = get_account_id()
+    original_region = get_region()
+    original_layers = dict(lsvc._layers._data)
+    foreign_layer_arn = "arn:aws:lambda:us-west-2:111111111111:layer:foreign-layer:1"
+
+    try:
+        lsvc._layers.clear()
+        lsvc._layers.set_scoped(
+            "111111111111",
+            "us-west-2",
+            "foreign-layer",
+            {"versions": [{"Version": 1, "_zip_data": b"secret"}]},
+        )
+        set_request_account_id("000000000000")
+        set_request_region("us-west-2")
+
+        assert lsvc._resolve_layer_zip(foreign_layer_arn) is None
+    finally:
+        lsvc._layers.clear()
+        lsvc._layers._data.update(original_layers)
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
 def test_lambda_restore_state_starts_poller_for_non_default_scoped_esms(monkeypatch):
     from ministack.core.responses import AccountRegionScopedDict
 

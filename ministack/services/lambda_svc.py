@@ -752,7 +752,9 @@ def _get_func_record_for_ref(function_ref: str) -> tuple[dict | None, dict | Non
         if spec and spec.service == "lambda":
             name, qualifier = _lambda_function_name_and_qualifier_from_arn(function_ref)
             if name:
-                func = _functions.get_scoped(spec.account_id, spec.region, name)
+                if spec.account_id != get_account_id():
+                    return None, None, name
+                func = _functions.get_scoped(get_account_id(), spec.region, name)
                 record, config = _effective_func_record_for_qualifier(func, qualifier)
                 return record, config, name
 
@@ -3276,6 +3278,8 @@ def _resolve_layer_zip(layer_arn_str: str) -> bytes | None:
     except ArnParseError:
         return None
     if spec.service != "lambda":
+        return None
+    if spec.account_id != get_account_id():
         return None
     parts = spec.resource.split(":", 2)
     if len(parts) != 3 or parts[0] != "layer":

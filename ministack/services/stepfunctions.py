@@ -894,7 +894,7 @@ def _scope_from_resource_arn(arn):
         return get_account_id(), get_region()
     if spec.service != "states":
         return get_account_id(), get_region()
-    return spec.account_id or get_account_id(), spec.region or get_region()
+    return get_account_id(), spec.region or get_region()
 
 
 # ---------------------------------------------------------------------------
