@@ -4555,110 +4555,114 @@ def _poll_kinesis():
     from ministack.services import kinesis as _kin
 
     for acct_id, region, esm in _iter_all_esms():
-        _request_account_id.set(acct_id)
-        _request_region.set(region)
-        if not esm.get("Enabled", True):
-            continue
-        source_arn = esm.get("EventSourceArn", "")
-        if ":kinesis:" not in source_arn:
-            continue
+        account_token = _request_account_id.set(acct_id)
+        region_token = _request_region.set(region)
+        try:
+            if not esm.get("Enabled", True):
+                continue
+            source_arn = esm.get("EventSourceArn", "")
+            if ":kinesis:" not in source_arn:
+                continue
 
-        func_name = esm["FunctionName"]
-        qualifier = esm.get("Qualifier")
-        func_rec, _cfg = _get_func_record_for_qualifier(func_name, qualifier)
-        if func_rec is None:
-            continue
+            func_name = esm["FunctionName"]
+            qualifier = esm.get("Qualifier")
+            func_rec, _cfg = _get_func_record_for_qualifier(func_name, qualifier)
+            if func_rec is None:
+                continue
 
-        stream_name = source_arn.split("/")[-1]
-        stream = _kin._streams.get(stream_name)
-        if not stream or stream["StreamStatus"] != "ACTIVE":
-            continue
+            stream_name = source_arn.split("/")[-1]
+            stream = _kin._streams.get(stream_name)
+            if not stream or stream["StreamStatus"] != "ACTIVE":
+                continue
 
-        esm_id = esm["UUID"]
-        if esm_id not in _kinesis_positions:
-            starting = esm.get("StartingPosition", "LATEST")
-            _kinesis_positions[esm_id] = {}
+            esm_id = esm["UUID"]
+            if esm_id not in _kinesis_positions:
+                starting = esm.get("StartingPosition", "LATEST")
+                _kinesis_positions[esm_id] = {}
+                for shard_id, shard in stream["shards"].items():
+                    if starting == "TRIM_HORIZON":
+                        _kinesis_positions[esm_id][shard_id] = 0
+                    else:
+                        _kinesis_positions[esm_id][shard_id] = len(shard["records"])
+
+            batch_size = esm.get("BatchSize", 100)
+            positions = _kinesis_positions[esm_id]
+
             for shard_id, shard in stream["shards"].items():
-                if starting == "TRIM_HORIZON":
-                    _kinesis_positions[esm_id][shard_id] = 0
+                if shard_id not in positions:
+                    positions[shard_id] = len(shard["records"])
+                    continue
+
+                pos = positions[shard_id]
+                raw_records = shard["records"][pos:pos + batch_size]
+                if not raw_records:
+                    continue
+
+                records = []
+                for r in raw_records:
+                    data_val = r["Data"]
+                    if isinstance(data_val, bytes):
+                        data_b64 = base64.b64encode(data_val).decode("ascii")
+                    elif isinstance(data_val, str):
+                        try:
+                            base64.b64decode(data_val, validate=True)
+                            data_b64 = data_val
+                        except Exception:
+                            data_b64 = base64.b64encode(data_val.encode("utf-8")).decode("ascii")
+                    else:
+                        data_b64 = base64.b64encode(str(data_val).encode("utf-8")).decode("ascii")
+
+                    records.append({
+                        "kinesis": {
+                            "kinesisSchemaVersion": "1.0",
+                            "partitionKey": r["PartitionKey"],
+                            "sequenceNumber": r["SequenceNumber"],
+                            "data": data_b64,
+                            "approximateArrivalTimestamp": r["ApproximateArrivalTimestamp"],
+                        },
+                        "eventSource": "aws:kinesis",
+                        "eventVersion": "1.0",
+                        "eventID": f"{shard_id}:{r['SequenceNumber']}",
+                        "eventName": "aws:kinesis:record",
+                        "invokeIdentityArn": f"arn:aws:iam::{get_account_id()}:role/lambda-role",
+                        "awsRegion": get_region(),
+                        "eventSourceARN": source_arn,
+                    })
+
+                # AWS drops records that don't match FilterCriteria before invoke.
+                # Advance past the raw batch we consumed — filtered records are
+                # treated as "successfully processed" (same semantics as the
+                # normal success path below, which adds len(raw_records)).
+                records = _apply_filter_criteria(records, esm)
+                if not records:
+                    _kinesis_positions[esm_id][shard_id] = pos + len(raw_records)
+                    continue
+
+                event = {"Records": records}
+                result = _execute_function(func_rec, event)
+
+                if result.get("error"):
+                    err_body = result.get("body") or {}
+                    err_type = err_body.get("errorType") if isinstance(err_body, dict) else None
+                    err_msg = err_body.get("errorMessage") if isinstance(err_body, dict) else None
+                    esm["LastProcessingResult"] = "FAILED"
+                    logger.warning(
+                        "ESM: Lambda %s failed processing Kinesis batch from %s/%s (errorType=%s errorMessage=%s)\n%s",
+                        func_name, stream_name, shard_id, err_type, err_msg, result.get("log", ""),
+                    )
                 else:
-                    _kinesis_positions[esm_id][shard_id] = len(shard["records"])
-
-        batch_size = esm.get("BatchSize", 100)
-        positions = _kinesis_positions[esm_id]
-
-        for shard_id, shard in stream["shards"].items():
-            if shard_id not in positions:
-                positions[shard_id] = len(shard["records"])
-                continue
-
-            pos = positions[shard_id]
-            raw_records = shard["records"][pos:pos + batch_size]
-            if not raw_records:
-                continue
-
-            records = []
-            for r in raw_records:
-                data_val = r["Data"]
-                if isinstance(data_val, bytes):
-                    data_b64 = base64.b64encode(data_val).decode("ascii")
-                elif isinstance(data_val, str):
-                    try:
-                        base64.b64decode(data_val, validate=True)
-                        data_b64 = data_val
-                    except Exception:
-                        data_b64 = base64.b64encode(data_val.encode("utf-8")).decode("ascii")
-                else:
-                    data_b64 = base64.b64encode(str(data_val).encode("utf-8")).decode("ascii")
-
-                records.append({
-                    "kinesis": {
-                        "kinesisSchemaVersion": "1.0",
-                        "partitionKey": r["PartitionKey"],
-                        "sequenceNumber": r["SequenceNumber"],
-                        "data": data_b64,
-                        "approximateArrivalTimestamp": r["ApproximateArrivalTimestamp"],
-                    },
-                    "eventSource": "aws:kinesis",
-                    "eventVersion": "1.0",
-                    "eventID": f"{shard_id}:{r['SequenceNumber']}",
-                    "eventName": "aws:kinesis:record",
-                    "invokeIdentityArn": f"arn:aws:iam::{get_account_id()}:role/lambda-role",
-                    "awsRegion": get_region(),
-                    "eventSourceARN": source_arn,
-                })
-
-            # AWS drops records that don't match FilterCriteria before invoke.
-            # Advance past the raw batch we consumed — filtered records are
-            # treated as "successfully processed" (same semantics as the
-            # normal success path below, which adds len(raw_records)).
-            records = _apply_filter_criteria(records, esm)
-            if not records:
-                _kinesis_positions[esm_id][shard_id] = pos + len(raw_records)
-                continue
-
-            event = {"Records": records}
-            result = _execute_function(func_rec, event)
-
-            if result.get("error"):
-                err_body = result.get("body") or {}
-                err_type = err_body.get("errorType") if isinstance(err_body, dict) else None
-                err_msg = err_body.get("errorMessage") if isinstance(err_body, dict) else None
-                esm["LastProcessingResult"] = "FAILED"
-                logger.warning(
-                    "ESM: Lambda %s failed processing Kinesis batch from %s/%s (errorType=%s errorMessage=%s)\n%s",
-                    func_name, stream_name, shard_id, err_type, err_msg, result.get("log", ""),
-                )
-            else:
-                positions[shard_id] = pos + len(raw_records)
-                esm["LastProcessingResult"] = f"OK - {len(raw_records)} records"
-                log_output = result.get("log", "")
-                if log_output:
-                    logger.info("ESM: Lambda %s output:\n%s", func_name, log_output)
-                logger.info(
-                    "ESM: Lambda %s processed %d Kinesis records from %s/%s",
-                    func_name, len(raw_records), stream_name, shard_id,
-                )
+                    positions[shard_id] = pos + len(raw_records)
+                    esm["LastProcessingResult"] = f"OK - {len(raw_records)} records"
+                    log_output = result.get("log", "")
+                    if log_output:
+                        logger.info("ESM: Lambda %s output:\n%s", func_name, log_output)
+                    logger.info(
+                        "ESM: Lambda %s processed %d Kinesis records from %s/%s",
+                        func_name, len(raw_records), stream_name, shard_id,
+                    )
+        finally:
+            _request_account_id.reset(account_token)
+            _request_region.reset(region_token)
 
 
 def _poll_dynamodb_streams():
@@ -4669,71 +4673,75 @@ def _poll_dynamodb_streams():
         return
 
     for acct_id, region, esm in _iter_all_esms():
-        _request_account_id.set(acct_id)
-        _request_region.set(region)
-        if not esm.get("Enabled", True):
-            continue
-        source_arn = esm.get("EventSourceArn", "")
-        if ":dynamodb:" not in source_arn or "/stream/" not in source_arn:
-            continue
+        account_token = _request_account_id.set(acct_id)
+        region_token = _request_region.set(region)
+        try:
+            if not esm.get("Enabled", True):
+                continue
+            source_arn = esm.get("EventSourceArn", "")
+            if ":dynamodb:" not in source_arn or "/stream/" not in source_arn:
+                continue
 
-        func_name = esm["FunctionName"]
-        qualifier = esm.get("Qualifier")
-        func_rec, _cfg = _get_func_record_for_qualifier(func_name, qualifier)
-        if func_rec is None:
-            continue
+            func_name = esm["FunctionName"]
+            qualifier = esm.get("Qualifier")
+            func_rec, _cfg = _get_func_record_for_qualifier(func_name, qualifier)
+            if func_rec is None:
+                continue
 
-        table_arn = source_arn.split("/stream/")[0]
-        table_name = table_arn.split("/")[-1]
-        table_records = stream_records.get(table_name, [])
-        if not table_records:
-            continue
+            table_arn = source_arn.split("/stream/")[0]
+            table_name = table_arn.split("/")[-1]
+            table_records = stream_records.get(table_name, [])
+            if not table_records:
+                continue
 
-        esm_id = esm["UUID"]
-        with _dynamodb_stream_positions_lock:
-            if esm_id not in _dynamodb_stream_positions:
-                starting = esm.get("StartingPosition", "LATEST")
-                if starting == "TRIM_HORIZON":
-                    _dynamodb_stream_positions[esm_id] = 0
-                else:
-                    _dynamodb_stream_positions[esm_id] = len(table_records)
-            pos = _dynamodb_stream_positions[esm_id]
-
-        batch_size = esm.get("BatchSize", 100)
-        batch = table_records[pos:pos + batch_size]
-        if not batch:
-            continue
-
-        batch = _apply_filter_criteria(batch, esm)
-        if not batch:
-            # All records filtered — advance position so we don't re-evaluate.
+            esm_id = esm["UUID"]
             with _dynamodb_stream_positions_lock:
-                _dynamodb_stream_positions[esm_id] = pos + batch_size
-            continue
+                if esm_id not in _dynamodb_stream_positions:
+                    starting = esm.get("StartingPosition", "LATEST")
+                    if starting == "TRIM_HORIZON":
+                        _dynamodb_stream_positions[esm_id] = 0
+                    else:
+                        _dynamodb_stream_positions[esm_id] = len(table_records)
+                pos = _dynamodb_stream_positions[esm_id]
 
-        event = {"Records": batch}
-        result = _execute_function(func_rec, event)
+            batch_size = esm.get("BatchSize", 100)
+            batch = table_records[pos:pos + batch_size]
+            if not batch:
+                continue
 
-        if result.get("error"):
-            err_body = result.get("body") or {}
-            err_type = err_body.get("errorType") if isinstance(err_body, dict) else None
-            err_msg = err_body.get("errorMessage") if isinstance(err_body, dict) else None
-            esm["LastProcessingResult"] = "FAILED"
-            logger.warning(
-                "ESM: Lambda %s failed processing DynamoDB stream batch from %s (errorType=%s errorMessage=%s)\n%s",
-                func_name, table_name, err_type, err_msg, result.get("log", ""),
-            )
-        else:
-            with _dynamodb_stream_positions_lock:
-                _dynamodb_stream_positions[esm_id] = pos + len(batch)
-            esm["LastProcessingResult"] = f"OK - {len(batch)} records"
-            log_output = result.get("log", "")
-            if log_output:
-                logger.info("ESM: Lambda %s output:\n%s", func_name, log_output)
-            logger.info(
-                "ESM: Lambda %s processed %d DynamoDB stream records from %s",
-                func_name, len(batch), table_name,
-            )
+            batch = _apply_filter_criteria(batch, esm)
+            if not batch:
+                # All records filtered — advance position so we don't re-evaluate.
+                with _dynamodb_stream_positions_lock:
+                    _dynamodb_stream_positions[esm_id] = pos + batch_size
+                continue
+
+            event = {"Records": batch}
+            result = _execute_function(func_rec, event)
+
+            if result.get("error"):
+                err_body = result.get("body") or {}
+                err_type = err_body.get("errorType") if isinstance(err_body, dict) else None
+                err_msg = err_body.get("errorMessage") if isinstance(err_body, dict) else None
+                esm["LastProcessingResult"] = "FAILED"
+                logger.warning(
+                    "ESM: Lambda %s failed processing DynamoDB stream batch from %s (errorType=%s errorMessage=%s)\n%s",
+                    func_name, table_name, err_type, err_msg, result.get("log", ""),
+                )
+            else:
+                with _dynamodb_stream_positions_lock:
+                    _dynamodb_stream_positions[esm_id] = pos + len(batch)
+                esm["LastProcessingResult"] = f"OK - {len(batch)} records"
+                log_output = result.get("log", "")
+                if log_output:
+                    logger.info("ESM: Lambda %s output:\n%s", func_name, log_output)
+                logger.info(
+                    "ESM: Lambda %s processed %d DynamoDB stream records from %s",
+                    func_name, len(batch), table_name,
+                )
+        finally:
+            _request_account_id.reset(account_token)
+            _request_region.reset(region_token)
 
 
 # ---------------------------------------------------------------------------

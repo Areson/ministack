@@ -21,6 +21,7 @@ Supports: CreateEventBus, UpdateEventBus, DeleteEventBus, ListEventBuses, Descri
 """
 
 import calendar
+import contextvars
 import copy
 import fnmatch
 import hashlib
@@ -1316,7 +1317,8 @@ def _start_replay(data):
         replay["State"] = "COMPLETED"
         replay["ReplayEndTime"] = _now_ts()
 
-    t = threading.Thread(target=_run, daemon=True)
+    ctx_snapshot = contextvars.copy_context()
+    t = threading.Thread(target=ctx_snapshot.run, args=(_run,), daemon=True)
     t.start()
 
     # Real AWS StartReplay returns the initial state STARTING; the

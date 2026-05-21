@@ -4381,6 +4381,61 @@ def test_lambda_restore_legacy_esm_offsets_uses_restored_esm_region(monkeypatch)
         set_request_region(original_region)
 
 
+def test_lambda_stream_pollers_restore_request_context(monkeypatch):
+    from ministack.services import dynamodb as _ddb
+
+    original_account = get_account_id()
+    original_region = get_region()
+    original_esms = dict(lsvc._esms._data)
+    original_stream_records = getattr(_ddb, "_stream_records", None)
+
+    try:
+        lsvc._esms.clear()
+        lsvc._esms.set_scoped(
+            "111111111111",
+            "us-west-2",
+            "esm-kinesis",
+            {
+                "UUID": "esm-kinesis",
+                "FunctionName": "missing-fn",
+                "EventSourceArn": "arn:aws:kinesis:us-west-2:111111111111:stream/source",
+                "Enabled": True,
+            },
+        )
+        lsvc._esms.set_scoped(
+            "111111111111",
+            "us-west-2",
+            "esm-ddb",
+            {
+                "UUID": "esm-ddb",
+                "FunctionName": "missing-fn",
+                "EventSourceArn": (
+                    "arn:aws:dynamodb:us-west-2:111111111111:table/source/stream/1"
+                ),
+                "Enabled": True,
+            },
+        )
+        monkeypatch.setattr(_ddb, "_stream_records", {"source": []}, raising=False)
+
+        set_request_account_id("000000000000")
+        set_request_region("us-east-1")
+
+        lsvc._poll_kinesis()
+        assert get_account_id() == "000000000000"
+        assert get_region() == "us-east-1"
+
+        lsvc._poll_dynamodb_streams()
+        assert get_account_id() == "000000000000"
+        assert get_region() == "us-east-1"
+    finally:
+        lsvc._esms.clear()
+        lsvc._esms._data.update(original_esms)
+        if original_stream_records is not None:
+            monkeypatch.setattr(_ddb, "_stream_records", original_stream_records, raising=False)
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
 def _run_nodejs_worker(handler_js, event_payload=None, env_extra=None):
     """Spin up a Node.js Lambda worker with the given handler, return invoke result."""
     import io

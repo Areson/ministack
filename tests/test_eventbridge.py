@@ -1432,6 +1432,69 @@ def test_scheduler_stepfunctions_target_uses_target_arn_region(monkeypatch):
         set_request_region(original_region)
 
 
+def test_eventbridge_replay_thread_preserves_request_context(monkeypatch):
+    from ministack.core.responses import get_account_id, get_region, set_request_account_id, set_request_region
+    from ministack.services import eventbridge as _eb
+
+    account_id = "123456789012"
+    region = "us-west-2"
+    original_account = get_account_id()
+    original_region = get_region()
+    original_archives = dict(_eb._archives._data)
+    original_replays = dict(_eb._replays._data)
+    calls = []
+    now = _eb._now_ts()
+
+    def _capture(event):
+        calls.append({
+            "account": get_account_id(),
+            "region": get_region(),
+            "bus": event["EventBusName"],
+        })
+
+    try:
+        _eb._archives.clear()
+        _eb._replays.clear()
+        monkeypatch.setattr(_eb, "_dispatch_event", _capture)
+        set_request_account_id(account_id)
+        set_request_region(region)
+        _eb._archives["replay-context-archive"] = {
+            "ArchiveName": "replay-context-archive",
+            "ArchiveArn": f"arn:aws:events:{region}:{account_id}:archive/replay-context-archive",
+            "Events": [{"Time": now, "EventBusName": "source-bus"}],
+        }
+
+        status, _headers, body = _eb._start_replay(
+            {
+                "ReplayName": "replay-context",
+                "EventSourceArn": (
+                    f"arn:aws:events:{region}:{account_id}:archive/replay-context-archive"
+                ),
+                "EventStartTime": now - 1,
+                "EventEndTime": now + 1,
+                "Destination": {
+                    "Arn": f"arn:aws:events:{region}:{account_id}:event-bus/dest-bus",
+                },
+            }
+        )
+
+        assert status == 200
+        assert json.loads(body)["State"] == "STARTING"
+
+        deadline = time.time() + 2
+        while not calls and time.time() < deadline:
+            time.sleep(0.01)
+
+        assert calls == [{"account": account_id, "region": region, "bus": "dest-bus"}]
+    finally:
+        _eb._archives.clear()
+        _eb._archives._data.update(original_archives)
+        _eb._replays.clear()
+        _eb._replays._data.update(original_replays)
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
 def test_scheduler_skips_rule_before_interval(isolated_scheduler):
     """Tick must NOT dispatch when interval hasn't elapsed."""
     _seed_rule()
