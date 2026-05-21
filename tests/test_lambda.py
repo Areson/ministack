@@ -4077,11 +4077,13 @@ def test_unsigned_dataplane_integrations_resolve_lambda_arn_region(monkeypatch):
             "Runtime": "python3.12",
         },
         "code_zip": b"",
+        "concurrency": 3,
         "versions": {},
     }
 
     def _fake_execute(exec_record, event):
         assert exec_record["config"]["FunctionArn"] == west_arn
+        assert exec_record["concurrency"] == 3
         status = 208 if "elb" in event.get("requestContext", {}) else 207
         return {"body": {"statusCode": status, "body": "west"}}
 

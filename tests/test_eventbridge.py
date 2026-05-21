@@ -1365,6 +1365,73 @@ def test_scheduler_fires_after_interval(isolated_scheduler):
     assert target_arg["Id"] == "t1"
 
 
+def test_scheduler_stepfunctions_target_uses_target_arn_region(monkeypatch):
+    from ministack.core.responses import get_account_id, get_region, set_request_account_id, set_request_region
+    from ministack.services import eventbridge as _eb
+    from ministack.services import stepfunctions as _sfn
+
+    account_id = "000000000000"
+    rule_key = "default|sfn-west-rule"
+    state_key = (account_id, rule_key)
+    sm_arn = "arn:aws:states:us-west-2:000000000000:stateMachine:sfn-west-sm"
+    original_account = get_account_id()
+    original_region = get_region()
+    original_rules = dict(_eb._rules._data)
+    original_targets = dict(_eb._targets._data)
+    original_last_fired = dict(_eb._rule_last_fired)
+    original_state_machines = dict(_sfn._state_machines._data)
+    calls = []
+
+    def _capture_start(data):
+        calls.append({"region": get_region(), "data": data})
+
+    try:
+        _eb._rules._data.clear()
+        _eb._targets._data.clear()
+        _eb._rule_last_fired.clear()
+        _sfn._state_machines.clear()
+        _sfn._state_machines.set_scoped(
+            account_id,
+            "us-west-2",
+            sm_arn,
+            {
+                "stateMachineArn": sm_arn,
+                "name": "sfn-west-sm",
+                "roleArn": f"arn:aws:iam::{account_id}:role/StepFunctionsRole",
+            },
+        )
+        _eb._rules._data[state_key] = {
+            "Name": "sfn-west-rule",
+            "ScheduleExpression": "rate(1 minute)",
+            "State": "ENABLED",
+            "EventBusName": "default",
+            "Arn": "arn:aws:events:us-west-2:000000000000:rule/sfn-west-rule",
+        }
+        _eb._targets._data[state_key] = [{"Id": "sfn", "Arn": sm_arn}]
+        _eb._rule_last_fired[state_key] = _eb._now_ts() - 65
+        monkeypatch.setattr(_sfn, "_start_execution", _capture_start)
+        set_request_account_id(account_id)
+        set_request_region("us-east-1")
+
+        _eb._tick_scheduled_rules()
+
+        assert calls
+        assert calls[0]["region"] == "us-west-2"
+        payload = json.loads(calls[0]["data"]["input"])
+        assert payload["region"] == "us-west-2"
+    finally:
+        _eb._rules._data.clear()
+        _eb._rules._data.update(original_rules)
+        _eb._targets._data.clear()
+        _eb._targets._data.update(original_targets)
+        _eb._rule_last_fired.clear()
+        _eb._rule_last_fired.update(original_last_fired)
+        _sfn._state_machines.clear()
+        _sfn._state_machines._data.update(original_state_machines)
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
 def test_scheduler_skips_rule_before_interval(isolated_scheduler):
     """Tick must NOT dispatch when interval hasn't elapsed."""
     _seed_rule()

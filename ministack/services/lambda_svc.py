@@ -804,6 +804,12 @@ def _run_with_function_config_scope(func_or_config: dict, callback, *args, **kwa
     return contextvars.copy_context().run(_run)
 
 
+def _execution_record_for_config(func: dict, config: dict) -> dict:
+    record = dict(func or {})
+    record["config"] = config
+    return record
+
+
 def _execute_function_with_config_scope(func: dict, event: dict) -> dict:
     return _run_with_function_config_scope(func, _execute_function, func, event)
 

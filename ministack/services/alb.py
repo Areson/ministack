@@ -1060,7 +1060,7 @@ async def _invoke_lambda_target(func_ref, tg_arn, method, path, headers, body, q
         "isBase64Encoded": is_b64,
     }
 
-    exec_record = {"config": func_config, "code_zip": func_data.get("code_zip")}
+    exec_record = lambda_svc._execution_record_for_config(func_data, func_config)
     result = await asyncio.to_thread(lambda_svc._execute_function_with_config_scope, exec_record, event)
 
     if result.get("error"):

@@ -32,6 +32,7 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import (
     AccountScopedDict,
     error_response_json,
@@ -40,6 +41,7 @@ from ministack.core.responses import (
     json_response,
     new_uuid,
     set_request_account_id,
+    set_request_region,
 )
 
 logger = logging.getLogger("events")
@@ -109,6 +111,13 @@ def _events_log_list() -> list:
         entries = []
         _events_log["entries"] = entries
     return entries
+
+
+def _arn_region(value: str) -> str | None:
+    try:
+        return parse_arn(value).region
+    except ArnParseError:
+        return None
 
 
 # ── Persistence ────────────────────────────────────────────
@@ -1093,16 +1102,31 @@ def _dispatch_to_sns(arn, payload):
 def _dispatch_to_stepfunctions(arn, payload):
     from ministack.services import stepfunctions as _sfn
 
-    if arn not in _sfn._state_machines:
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        logger.warning("EventBridge → Step Functions: invalid state machine ARN %s", arn)
+        return
+
+    if spec.account_id != get_account_id():
         logger.warning("EventBridge → Step Functions: state machine %s not found", arn)
         return
 
-    sm_name = arn.rsplit(":", 1)[-1]
-    _sfn._start_execution({
-        "stateMachineArn": arn,
-        "input": payload,
-    })
-    logger.info("EventBridge → Step Functions %s: dispatched", sm_name)
+    previous_region = get_region()
+    set_request_region(spec.region)
+    try:
+        if arn not in _sfn._state_machines:
+            logger.warning("EventBridge → Step Functions: state machine %s not found", arn)
+            return
+
+        sm_name = arn.rsplit(":", 1)[-1]
+        _sfn._start_execution({
+            "stateMachineArn": arn,
+            "input": payload,
+        })
+        logger.info("EventBridge → Step Functions %s: dispatched", sm_name)
+    finally:
+        set_request_region(previous_region)
 
 
 # ---------------------------------------------------------------------------
@@ -2145,28 +2169,36 @@ def _tick_scheduled_rules():
         targets = _targets._data.get((account_id, rule_key), [])
         if not targets:
             continue
-        # Set the account context so ARN-building and Lambda dispatch use the
-        # correct account for this rule's tenant.
+        # Set the account and rule-region context so scheduled events mirror
+        # the region where the rule was created, not the scheduler thread's
+        # process default.
+        previous_account = get_account_id()
+        previous_region = get_region()
         set_request_account_id(account_id)
-        event = {
-            "EventId": new_uuid(),
-            "Source": "aws.events",
-            "DetailType": "Scheduled Event",
-            "Detail": "{}",
-            "EventBusName": rule.get("EventBusName", "default"),
-            "Time": now,
-            "Resources": [rule.get("Arn", "")],
-            "Account": account_id,
-            "Region": get_region(),
-        }
-        for target in targets:
-            try:
-                _invoke_target(target, event, rule)
-            except Exception:
-                logger.exception(
-                    "EventBridge scheduler: dispatch error for rule %s account %s",
-                    rule_key, account_id,
-                )
+        set_request_region(_arn_region(rule.get("Arn", "")) or previous_region)
+        try:
+            event = {
+                "EventId": new_uuid(),
+                "Source": "aws.events",
+                "DetailType": "Scheduled Event",
+                "Detail": "{}",
+                "EventBusName": rule.get("EventBusName", "default"),
+                "Time": now,
+                "Resources": [rule.get("Arn", "")],
+                "Account": account_id,
+                "Region": get_region(),
+            }
+            for target in targets:
+                try:
+                    _invoke_target(target, event, rule)
+                except Exception:
+                    logger.exception(
+                        "EventBridge scheduler: dispatch error for rule %s account %s",
+                        rule_key, account_id,
+                    )
+        finally:
+            set_request_account_id(previous_account)
+            set_request_region(previous_region)
 
 
 def _scheduler_loop():
