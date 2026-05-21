@@ -793,15 +793,19 @@ def _get_func_record_for_ref(function_ref: str) -> tuple[dict | None, dict | Non
     return record, config, name
 
 
-def _execute_function_with_config_scope(func: dict, event: dict) -> dict:
+def _run_with_function_config_scope(func_or_config: dict, callback, *args, **kwargs):
     def _run():
-        config = func.get("config") or func
+        config = func_or_config.get("config") or func_or_config
         account_id, region = _account_region_from_function_config(config)
         _request_account_id.set(account_id)
         _request_region.set(region)
-        return _execute_function(func, event)
+        return callback(*args, **kwargs)
 
     return contextvars.copy_context().run(_run)
+
+
+def _execute_function_with_config_scope(func: dict, event: dict) -> dict:
+    return _run_with_function_config_scope(func, _execute_function, func, event)
 
 
 # ---------------------------------------------------------------------------

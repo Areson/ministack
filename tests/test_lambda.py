@@ -4055,6 +4055,90 @@ def test_lambda_layer_zip_rejects_foreign_account_arn():
         set_request_region(original_region)
 
 
+def test_unsigned_dataplane_integrations_resolve_lambda_arn_region(monkeypatch):
+    import asyncio
+
+    from ministack.services import alb as _alb
+    from ministack.services import apigateway as _apigw
+    from ministack.services import apigateway_v1 as _apigw_v1
+
+    original_account = get_account_id()
+    original_region = get_region()
+    original_functions = dict(lsvc._functions._data)
+    west_arn = "arn:aws:lambda:us-west-2:000000000000:function:dataplane-west-fn"
+    wrapper = (
+        "arn:aws:apigateway:us-west-2:lambda:path/2015-03-31/functions/"
+        f"{west_arn}/invocations"
+    )
+    func = {
+        "config": {
+            "FunctionName": "dataplane-west-fn",
+            "FunctionArn": west_arn,
+            "Runtime": "python3.12",
+        },
+        "code_zip": b"",
+        "versions": {},
+    }
+
+    def _fake_execute(exec_record, event):
+        assert exec_record["config"]["FunctionArn"] == west_arn
+        status = 208 if "elb" in event.get("requestContext", {}) else 207
+        return {"body": {"statusCode": status, "body": "west"}}
+
+    async def _run():
+        http_status, _headers, _body = await _apigw._invoke_lambda_proxy(
+            {"integrationUri": wrapper},
+            "api-id",
+            "$default",
+            "/test",
+            "GET",
+            {},
+            b"",
+            {},
+        )
+        assert http_status == 207
+
+        rest_status, _headers, _body = await _apigw_v1._invoke_lambda_proxy_v1(
+            {"uri": wrapper},
+            "api-id",
+            "dev",
+            {},
+            {"id": "res-id", "path": "/test"},
+            "/test",
+            "GET",
+            {},
+            b"",
+            {},
+            {},
+        )
+        assert rest_status == 207
+
+        alb_status, _headers, _body = await _alb._invoke_lambda_target(
+            west_arn,
+            "arn:aws:elasticloadbalancing:us-east-1:000000000000:targetgroup/tg/1",
+            "GET",
+            "/test",
+            {},
+            b"",
+            {},
+        )
+        assert alb_status == 208
+
+    try:
+        lsvc._functions.clear()
+        lsvc._functions.set_scoped("000000000000", "us-west-2", "dataplane-west-fn", func)
+        monkeypatch.setattr(lsvc, "_execute_function_with_config_scope", _fake_execute)
+        set_request_account_id("000000000000")
+        set_request_region("us-east-1")
+
+        asyncio.run(_run())
+    finally:
+        lsvc._functions.clear()
+        lsvc._functions._data.update(original_functions)
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
 def test_lambda_restore_state_starts_poller_for_non_default_scoped_esms(monkeypatch):
     from ministack.core.responses import AccountRegionScopedDict
 

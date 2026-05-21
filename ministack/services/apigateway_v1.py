@@ -496,7 +496,7 @@ def _match_recursive(resources, parent_id, segments, params):
     return None, params
 
 
-async def _call_lambda(func_name, event, qualifier=None):
+async def _call_lambda(function_ref, event, qualifier=None):
     """Invoke a Lambda function and return the parsed response dict.
 
     ``qualifier`` may be a version number or alias name; aliases resolve to
@@ -504,7 +504,11 @@ async def _call_lambda(func_name, event, qualifier=None):
     integration URIs (arn:...:function:<name>:<alias>) invoke correctly (#407)."""
     from ministack.services import lambda_svc
 
-    func_data, func_config = lambda_svc._get_func_record_for_qualifier(func_name, qualifier)
+    if qualifier is None:
+        func_data, func_config, func_name = lambda_svc._get_func_record_for_ref(function_ref)
+    else:
+        func_name = function_ref
+        func_data, func_config = lambda_svc._get_func_record_for_qualifier(func_name, qualifier)
     if func_data is None:
         label = f"{func_name}:{qualifier}" if qualifier else func_name
         return None, f"Lambda function '{label}' not found"
@@ -514,7 +518,7 @@ async def _call_lambda(func_name, event, qualifier=None):
     # Response shaping (throttle→429, error→502, body→envelope) goes through
     # the shared helper so v1/v2 stay consistent.
     exec_record = {"config": func_config, "code_zip": func_data.get("code_zip")}
-    result = await asyncio.to_thread(lambda_svc._execute_function, exec_record, event)
+    result = await asyncio.to_thread(lambda_svc._execute_function_with_config_scope, exec_record, event)
     lambda_response, _ = lambda_svc.lambda_execute_result_to_api_proxy_response(result)
     # On error the helper returns {statusCode: 502, body: <msg>}; preserve
     # the _call_lambda contract of (None, error_msg) so callers that check
@@ -911,13 +915,10 @@ async def _invoke_lambda_proxy_v1(integration, api_id, stage_name, stage, resour
     #   2. arn:aws:lambda:{region}:{acct}:function:{name}[:{qualifier}]
     #   3. plain function name: MyFunction[:{qualifier}]
     from ministack.services import lambda_svc as _lambda_svc
-    if "function:" in uri:
-        # Strip wrapper up through 'function:' and any trailing /invocations.
-        tail = uri.split("function:")[-1].split("/")[0]
-        # tail is now "<name>" or "<name>:<qualifier>".
-        func_name, qualifier = _lambda_svc._resolve_name_and_qualifier(tail)
+    if "/functions/" in uri and "/invocations" in uri:
+        lambda_ref = uri.split("/functions/", 1)[1].rsplit("/invocations", 1)[0]
     else:
-        func_name, qualifier = _lambda_svc._resolve_name_and_qualifier(uri)
+        lambda_ref = uri
 
     qs_params = {k: v[0] for k, v in query_params.items()} if query_params else None
     mv_qs_params = {k: list(v) for k, v in query_params.items()} if query_params else None
@@ -965,7 +966,7 @@ async def _invoke_lambda_proxy_v1(integration, api_id, stage_name, stage, resour
         "isBase64Encoded": False,
     }
 
-    lambda_response, err = await _call_lambda(func_name, event, qualifier=qualifier)
+    lambda_response, err = await _call_lambda(lambda_ref, event)
     if err:
         return 502, {"Content-Type": "application/json"}, json.dumps({"message": err}).encode()
 

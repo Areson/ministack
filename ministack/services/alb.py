@@ -16,6 +16,7 @@ Supports:
   Tags:                 AddTags, RemoveTags, DescribeTags
 """
 
+import asyncio
 import base64
 import copy
 import fnmatch
@@ -1016,22 +1017,22 @@ async def _forward_to_tg(tg_arn, method, path, headers, body, query_params):
 
     if target_type == "lambda":
         func_id = registered[0]["Id"]
-        func_name = func_id.split(":function:")[-1].split(":")[0] if ":function:" in func_id else func_id
-        return await _invoke_lambda_target(func_name, tg_arn, method, path,
+        return await _invoke_lambda_target(func_id, tg_arn, method, path,
                                            headers, body, query_params)
 
     return (502, {"Content-Type": "application/json"},
             json.dumps({"message": f"Target type '{target_type}' not supported."}).encode())
 
 
-async def _invoke_lambda_target(func_name, tg_arn, method, path, headers, body, query_params):
+async def _invoke_lambda_target(func_ref, tg_arn, method, path, headers, body, query_params):
     try:
         from ministack.services import lambda_svc
     except ImportError:
         return (502, {"Content-Type": "application/json"},
                 json.dumps({"message": "Lambda service unavailable"}).encode())
 
-    if func_name not in lambda_svc._functions:
+    func_data, func_config, func_name = lambda_svc._get_func_record_for_ref(func_ref)
+    if func_data is None:
         return (502, {"Content-Type": "application/json"},
                 json.dumps({"message": f"Lambda function '{func_name}' not found"}).encode())
 
@@ -1059,26 +1060,28 @@ async def _invoke_lambda_target(func_name, tg_arn, method, path, headers, body, 
         "isBase64Encoded": is_b64,
     }
 
-    _, resp_headers, resp_body = await lambda_svc._invoke(func_name, event, {})
+    exec_record = {"config": func_config, "code_zip": func_data.get("code_zip")}
+    result = await asyncio.to_thread(lambda_svc._execute_function_with_config_scope, exec_record, event)
 
-    if resp_headers.get("X-Amz-Function-Error"):
-        raw = resp_body.decode("utf-8", errors="replace") if isinstance(resp_body, bytes) else str(resp_body)
+    if result.get("error"):
+        err_body = result.get("body", "")
+        raw = json.dumps(err_body) if isinstance(err_body, dict) else str(err_body)
         return (502, {"Content-Type": "application/json"},
                 json.dumps({"message": f"Lambda error: {raw}"}).encode())
 
     try:
-        result = json.loads(resp_body) if isinstance(resp_body, bytes) else resp_body
-        if not isinstance(result, dict):
+        payload = result.get("body")
+        if not isinstance(payload, dict):
             return (200, {"Content-Type": "text/plain"},
-                    str(result).encode("utf-8"))
+                    str(payload).encode("utf-8"))
 
-        resp_code = int(result.get("statusCode", 200))
-        out_headers = dict(result.get("headers") or {})
-        for k, vals in (result.get("multiValueHeaders") or {}).items():
+        resp_code = int(payload.get("statusCode", 200))
+        out_headers = dict(payload.get("headers") or {})
+        for k, vals in (payload.get("multiValueHeaders") or {}).items():
             out_headers[k] = vals[-1]
 
-        out_body = result.get("body", "")
-        if result.get("isBase64Encoded"):
+        out_body = payload.get("body", "")
+        if payload.get("isBase64Encoded"):
             out_body = base64.b64decode(out_body)
         elif isinstance(out_body, str):
             out_body = out_body.encode("utf-8")
@@ -1088,7 +1091,8 @@ async def _invoke_lambda_target(func_name, tg_arn, method, path, headers, body, 
         return resp_code, out_headers, out_body
 
     except Exception:
-        raw = resp_body if isinstance(resp_body, bytes) else str(resp_body).encode()
+        raw_body = result.get("body")
+        raw = raw_body if isinstance(raw_body, bytes) else str(raw_body).encode()
         return 200, {"Content-Type": "text/plain"}, raw
 
 
