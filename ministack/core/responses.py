@@ -13,6 +13,8 @@ import uuid
 from datetime import datetime, timezone
 from xml.etree.ElementTree import Element, SubElement, tostring
 
+from ministack.core.arn import ArnParseError, parse_arn
+
 # Request-scoped account ID for multi-tenancy.
 # Set per-request in app.py from the Authorization header.
 _request_account_id: contextvars.ContextVar[str] = contextvars.ContextVar(
@@ -274,20 +276,23 @@ class AccountRegionScopedDict:
     def has_any(self):
         return bool(self._data)
 
+    def _region_for_legacy_value(self, key, value):
+        return _region_from_arnish(value) or _region_from_arnish(key) or get_region()
+
     def update(self, other):
         if isinstance(other, AccountRegionScopedDict):
             self._data.update(other._data)
         elif isinstance(other, AccountScopedDict):
-            region = get_region()
             for (account_id, key), value in other._data.items():
+                region = self._region_for_legacy_value(key, value)
                 self._data[(account_id, region, key)] = value
         elif isinstance(other, dict):
-            region = get_region()
             for k, v in other.items():
                 if isinstance(k, tuple) and len(k) == 3:
                     self._data[k] = v
                 elif isinstance(k, tuple) and len(k) == 2:
                     account_id, original_key = k
+                    region = self._region_for_legacy_value(original_key, v)
                     self._data[(account_id, region, original_key)] = v
                 else:
                     self[k] = v
@@ -309,6 +314,36 @@ class AccountRegionScopedDict:
 
     def __repr__(self):
         return f"AccountRegionScopedDict({dict(self.items())})"
+
+
+def _region_from_arnish(value):
+    if isinstance(value, str):
+        if not value.startswith("arn:"):
+            return None
+        try:
+            region = parse_arn(value).region
+        except ArnParseError:
+            return None
+        return region or None
+
+    if isinstance(value, dict):
+        for key, candidate in value.items():
+            if isinstance(key, str) and key.lower().endswith("arn"):
+                region = _region_from_arnish(candidate)
+                if region:
+                    return region
+        for candidate in value.values():
+            region = _region_from_arnish(candidate)
+            if region:
+                return region
+        return None
+
+    if isinstance(value, (list, tuple, set)):
+        for candidate in value:
+            region = _region_from_arnish(candidate)
+            if region:
+                return region
+    return None
 
 
 def xml_response(root_tag: str, namespace: str, children: dict, status: int = 200) -> tuple:

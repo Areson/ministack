@@ -3849,6 +3849,93 @@ def test_lambda_function_config_account_region_rejects_malformed_arn():
         })
 
 
+def test_lambda_restore_legacy_account_scoped_functions_uses_function_arn_region():
+    from ministack.core.responses import AccountScopedDict
+
+    original_functions = dict(lsvc._functions._data)
+
+    try:
+        lsvc._functions.clear()
+        legacy = AccountScopedDict()
+        legacy._data[("111111111111", "legacy-west-fn")] = {
+            "config": {
+                "FunctionName": "legacy-west-fn",
+                "FunctionArn": "arn:aws:lambda:us-west-2:111111111111:function:legacy-west-fn",
+            },
+            "versions": {},
+        }
+
+        set_request_account_id("111111111111")
+        set_request_region("us-east-1")
+        lsvc.restore_state({"functions": legacy})
+
+        assert lsvc._functions.get_scoped("111111111111", "us-west-2", "legacy-west-fn")
+        assert lsvc._functions.get_scoped("111111111111", "us-east-1", "legacy-west-fn") is None
+    finally:
+        lsvc._functions.clear()
+        lsvc._functions._data.update(original_functions)
+
+
+def test_lambda_async_retry_thread_uses_function_arn_region(monkeypatch):
+    import threading
+
+    original_account = get_account_id()
+    original_region = get_region()
+    original_functions = dict(lsvc._functions._data)
+    done = threading.Event()
+    observed = {}
+
+    func = {
+        "config": {
+            "FunctionName": "async-west-fn",
+            "FunctionArn": "arn:aws:lambda:us-west-2:000000000000:function:async-west-fn",
+        },
+        "event_invoke_config": {
+            "MaximumRetryAttempts": 0,
+            "DestinationConfig": {
+                "OnFailure": {
+                    "Destination": "arn:aws:sqs:us-west-2:000000000000:async-west-dlq",
+                },
+            },
+        },
+    }
+
+    def _fail(_func, _event):
+        return {
+            "error": True,
+            "function_error": "Unhandled",
+            "body": {"errorMessage": "boom"},
+        }
+
+    def _capture(_target_arn, func_name, _event, _result):
+        observed["region"] = get_region()
+        observed["function_arn"] = (
+            lsvc._functions.get(func_name, {}).get("config", {}).get("FunctionArn", "")
+        )
+        done.set()
+
+    try:
+        lsvc._functions.clear()
+        lsvc._functions.set_scoped("000000000000", "us-west-2", "async-west-fn", func)
+        monkeypatch.setattr(lsvc, "_execute_function", _fail)
+        monkeypatch.setattr(lsvc, "_route_async_failure", _capture)
+
+        set_request_account_id("000000000000")
+        set_request_region("us-west-2")
+        lsvc.invoke_async_with_retry(func, {"hello": "world"})
+
+        assert done.wait(2), "async retry thread did not route the failure"
+        assert observed == {
+            "region": "us-west-2",
+            "function_arn": "arn:aws:lambda:us-west-2:000000000000:function:async-west-fn",
+        }
+    finally:
+        lsvc._functions.clear()
+        lsvc._functions._data.update(original_functions)
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
 def test_lambda_restore_state_starts_poller_for_non_default_scoped_esms(monkeypatch):
     from ministack.core.responses import AccountRegionScopedDict
 

@@ -71,6 +71,72 @@ def test_account_region_scoped_dict_persistence_round_trip(monkeypatch, tmp_path
         set_request_region(original_region)
 
 
+def test_account_region_scoped_dict_migrates_legacy_values_to_arn_region():
+    from ministack.core.responses import (
+        AccountRegionScopedDict,
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+
+    original_account = get_account_id()
+    original_region = get_region()
+
+    try:
+        legacy = AccountScopedDict()
+        legacy._data[("111111111111", "west-sm")] = {
+            "stateMachineArn": "arn:aws:states:us-west-2:111111111111:stateMachine:west-sm",
+        }
+
+        restored = AccountRegionScopedDict()
+        set_request_account_id("111111111111")
+        set_request_region("us-east-1")
+        restored.update(legacy)
+
+        assert restored.get_scoped("111111111111", "us-west-2", "west-sm") == {
+            "stateMachineArn": "arn:aws:states:us-west-2:111111111111:stateMachine:west-sm",
+        }
+        assert restored.get_scoped("111111111111", "us-east-1", "west-sm") is None
+    finally:
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_rds_restore_legacy_account_scoped_instances_uses_instance_arn_region():
+    from ministack.core.responses import (
+        AccountScopedDict,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import rds as m
+
+    original_instances = dict(m._instances._data)
+
+    try:
+        m._instances.clear()
+        legacy = AccountScopedDict()
+        legacy._data[("111111111111", "legacy-west-db")] = {
+            "DBInstanceIdentifier": "legacy-west-db",
+            "DBInstanceArn": "arn:aws:rds:us-west-2:111111111111:db:legacy-west-db",
+            "DBInstanceStatus": "stopped",
+            "_docker_container_id": "old-container",
+        }
+
+        set_request_account_id("111111111111")
+        set_request_region("us-east-1")
+        m.restore_state({"instances": legacy})
+
+        inst = m._instances.get_scoped("111111111111", "us-west-2", "legacy-west-db")
+        assert inst["DBInstanceStatus"] == "available"
+        assert inst["_docker_container_id"] is None
+        assert m._instances.get_scoped("111111111111", "us-east-1", "legacy-west-db") is None
+    finally:
+        m._instances.clear()
+        m._instances._data.update(original_instances)
+
+
 @pytest.mark.parametrize("svc_key,mod_name", ALL_PERSISTED_SERVICES)
 def test_service_has_restore_path(svc_key, mod_name):
     """Every service in `_state_map` must expose a way to restore its own state.

@@ -240,13 +240,13 @@ def restore_state(data):
                         ver["code_zip"] = base64.b64decode(ver["code_zip"])
                 _functions._data[scoped_key] = func
         elif isinstance(funcs, AccountScopedDict):
-            region = get_region()
             for (account_id, name), func in funcs._data.items():
                 if func.get("code_zip") and isinstance(func["code_zip"], str):
                     func["code_zip"] = base64.b64decode(func["code_zip"])
                 for ver in func.get("versions", {}).values():
                     if ver.get("code_zip") and isinstance(ver["code_zip"], str):
                         ver["code_zip"] = base64.b64decode(ver["code_zip"])
+                region = _region_from_function_record(func)
                 _functions._data[(account_id, region, name)] = func
         else:
             for name, func in funcs.items():
@@ -263,6 +263,17 @@ def restore_state(data):
         _dynamodb_stream_positions.update(data.get("dynamodb_stream_positions", {}))
         if _esms.has_any():
             _ensure_poller()
+
+
+def _region_from_function_record(func: dict) -> str:
+    arn = (func.get("config") or {}).get("FunctionArn") or func.get("FunctionArn") or ""
+    if arn:
+        try:
+            _account_id, region = _lambda_function_account_region_from_arn(arn)
+            return region
+        except ArnParseError:
+            pass
+    return get_region()
 
 
 # NOTE: the persisted-state load used to run here, but ``restore_state`` calls
@@ -1870,6 +1881,9 @@ def invoke_async_with_retry(func: dict, event: dict) -> None:
     """
     def _run():
         config = func.get("config") or func
+        account_id, region = _account_region_from_function_config(config)
+        _request_account_id.set(account_id)
+        _request_region.set(region)
         fn_name = config.get("FunctionName", "unknown")
         eic = func.get("event_invoke_config") or {}
         max_retries = eic.get("MaximumRetryAttempts")
@@ -1905,7 +1919,8 @@ def invoke_async_with_retry(func: dict, event: dict) -> None:
         if on_failure_arn and last_result is not None:
             _route_async_failure(on_failure_arn, fn_name, event, last_result)
 
-    threading.Thread(target=_run, daemon=True).start()
+    ctx_snapshot = contextvars.copy_context()
+    threading.Thread(target=ctx_snapshot.run, args=(_run,), daemon=True).start()
 
 
 def _match_esm_filter(record: dict, pattern: dict) -> bool:

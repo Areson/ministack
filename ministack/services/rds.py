@@ -120,19 +120,29 @@ def restore_state(data):
             inst["DBInstanceStatus"] = "available"
             _instances._data[key] = inst
     elif isinstance(instances_data, AccountScopedDict):
-        # Legacy account-scoped format: adopt into the default/current region.
-        region = get_region()
+        # Legacy account-scoped format: preserve the instance ARN region when available.
         for key, inst in list(instances_data._data.items()):
             account_id, instance_id = key
             inst["_docker_container_id"] = None
             inst["DBInstanceStatus"] = "available"
+            region = _region_from_record_arn(inst, "DBInstanceArn")
             _instances._data[(account_id, region, instance_id)] = inst
     else:
         # Legacy format: plain dict keyed by instance name
         for name, inst in instances_data.items():
             inst["_docker_container_id"] = None
             inst["DBInstanceStatus"] = "available"
-            _instances[name] = inst
+            region = _region_from_record_arn(inst, "DBInstanceArn")
+            _instances.set_scoped(get_account_id(), region, name, inst)
+
+
+def _region_from_record_arn(record, field):
+    arn = record.get(field, "") if isinstance(record, dict) else ""
+    try:
+        region = parse_arn(arn).region
+    except ArnParseError:
+        return get_region()
+    return region or get_region()
 
 
 try:
