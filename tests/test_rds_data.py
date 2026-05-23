@@ -10,8 +10,11 @@ Since no real DB containers are available in CI, these tests focus on:
 import json
 import os
 import urllib.request
+import uuid
 
+import boto3
 import pytest
+from botocore.config import Config
 from botocore.exceptions import ClientError
 
 ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
@@ -42,6 +45,17 @@ def _raw_post(path, body):
         return resp.status, json.loads(resp.read())
     except urllib.error.HTTPError as e:
         return e.code, json.loads(e.read())
+
+
+def _regional_client(service, region, access_key_id="test"):
+    return boto3.client(
+        service,
+        endpoint_url=ENDPOINT,
+        aws_access_key_id=access_key_id,
+        aws_secret_access_key="test",
+        region_name=region,
+        config=Config(region_name=region, retries={"mode": "standard"}),
+    )
 
 
 # ── Routing tests ──────────────────────────────────────────
@@ -127,6 +141,73 @@ def test_execute_nonexistent_cluster():
     })
     assert status == 400
     assert "not found" in body.get("message", body.get("Message", "")).lower()
+
+
+def test_execute_rejects_foreign_region_cluster_arn():
+    """ExecuteStatement should not resolve a cluster ARN from another region."""
+    west = _regional_client("rds", "us-west-2")
+    cluster_id = f"rds-data-foreign-region-{uuid.uuid4().hex[:8]}"
+
+    try:
+        cluster = west.create_db_cluster(
+            DBClusterIdentifier=cluster_id,
+            Engine="aurora-mysql",
+            MasterUsername="admin",
+            MasterUserPassword="password123",
+        )["DBCluster"]
+
+        status, body = _raw_post("/Execute", {
+            "resourceArn": cluster["DBClusterArn"],
+            "secretArn": FAKE_SECRET_ARN,
+            "sql": "SELECT 1",
+        })
+        assert status == 400
+        assert "not found" in body.get("message", body.get("Message", "")).lower()
+    finally:
+        try:
+            west.delete_db_cluster(DBClusterIdentifier=cluster_id, SkipFinalSnapshot=True)
+        except ClientError:
+            pass
+
+
+def test_execute_rejects_foreign_account_cluster_arn():
+    """ExecuteStatement should not resolve a cluster ARN from another account."""
+    owner_account = "111111111111"
+    owner = _regional_client("rds", REGION, access_key_id=owner_account)
+    cluster_id = f"rds-data-foreign-account-{uuid.uuid4().hex[:8]}"
+
+    try:
+        cluster = owner.create_db_cluster(
+            DBClusterIdentifier=cluster_id,
+            Engine="aurora-mysql",
+            MasterUsername="admin",
+            MasterUserPassword="password123",
+        )["DBCluster"]
+
+        assert f":{owner_account}:" in cluster["DBClusterArn"]
+        status, body = _raw_post("/Execute", {
+            "resourceArn": cluster["DBClusterArn"],
+            "secretArn": FAKE_SECRET_ARN,
+            "sql": "SELECT 1",
+        })
+        assert status == 400
+        assert "not found" in body.get("message", body.get("Message", "")).lower()
+    finally:
+        try:
+            owner.delete_db_cluster(DBClusterIdentifier=cluster_id, SkipFinalSnapshot=True)
+        except ClientError:
+            pass
+
+
+def test_cluster_id_from_arn_preserves_colon_resource_tail():
+    from ministack.services import rds_data
+
+    assert (
+        rds_data._cluster_id_from_arn(
+            "arn:aws:rds:us-east-1:000000000000:cluster:cluster-id:tail",
+        )
+        == "cluster-id:tail"
+    )
 
 
 def test_begin_transaction_nonexistent_cluster():
