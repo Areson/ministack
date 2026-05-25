@@ -183,6 +183,21 @@ def _local_tag_name(el) -> str:
     return t.split("}")[-1] if "}" in t else t
 
 
+def _add_xml_block(parent, source_el):
+    block = SubElement(parent, _local_tag_name(source_el))
+    block.text = source_el.text
+    block.attrib.update(source_el.attrib)
+    for child in source_el:
+        _add_xml_block(block, child)
+    return block
+
+
+def _add_config_block(parent, config_el, tag):
+    child = _find(config_el, tag)
+    if child is not None:
+        _add_xml_block(parent, child)
+
+
 def _unwrap_distribution_create_xml(root_el):
     """Return ``(DistributionConfig element, Tags element or None)``.
 
@@ -839,6 +854,9 @@ def _list_distributions():
                 SubElement(ds, "DomainName").text = dist["DomainName"]
                 SubElement(ds, "Enabled").text = str(dist["enabled"]).lower()
                 SubElement(ds, "Comment").text = _text(fromstring(dist["config_xml"]), "Comment")
+                config_el = fromstring(dist["config_xml"])
+                _add_config_block(ds, config_el, "Origins")
+                _add_config_block(ds, config_el, "DefaultCacheBehavior")
 
     return _xml_response("DistributionList", build)
 
@@ -926,6 +944,29 @@ def _create_invalidation(dist_id, body):
             for child in items_el:
                 if child.text:
                     path_items.append(child.text)
+
+    invs = _invalidations[dist_id]
+    for existing in invs:
+        if existing["InvalidationBatch"]["CallerReference"] == caller_ref:
+            existing_paths = existing["InvalidationBatch"]["Paths"]["Items"]
+            if set(existing_paths) != set(path_items):
+                return _error(
+                    "InvalidationBatchAlreadyExists",
+                    "An invalidation batch with this CallerReference already exists.",
+                    400,
+                )
+
+            def build(root, _inv=existing):
+                _build_invalidation_xml(root, _inv)
+
+            return _xml_response(
+                "Invalidation",
+                build,
+                status=201,
+                extra_headers={
+                    "Location": f"/2020-05-31/distribution/{dist_id}/invalidation/{existing['Id']}",
+                },
+            )
 
     inv_id = _inv_id()
     now = _now_iso()

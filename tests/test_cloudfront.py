@@ -1,3 +1,4 @@
+import copy
 import io
 import json
 import os
@@ -35,6 +36,51 @@ _CF_DIST_CONFIG = {
     "Comment": "test distribution",
     "Enabled": True,
 }
+
+
+def _custom_origin_distribution_config(caller_reference):
+    return {
+        "CallerReference": caller_reference,
+        "Origins": {
+            "Quantity": 1,
+            "Items": [
+                {
+                    "Id": "custom-origin",
+                    "DomainName": "origin.example.com",
+                    "OriginPath": "/app",
+                    "CustomHeaders": {
+                        "Quantity": 1,
+                        "Items": [{"HeaderName": "X-Origin-Test", "HeaderValue": "yes"}],
+                    },
+                    "CustomOriginConfig": {
+                        "HTTPPort": 80,
+                        "HTTPSPort": 443,
+                        "OriginProtocolPolicy": "https-only",
+                        "OriginSslProtocols": {"Quantity": 1, "Items": ["TLSv1.2"]},
+                        "OriginReadTimeout": 30,
+                        "OriginKeepaliveTimeout": 5,
+                    },
+                }
+            ],
+        },
+        "DefaultCacheBehavior": {
+            "TargetOriginId": "custom-origin",
+            "ViewerProtocolPolicy": "redirect-to-https",
+            "ForwardedValues": {
+                "QueryString": True,
+                "Cookies": {"Forward": "all"},
+            },
+            "MinTTL": 0,
+        },
+        "Comment": "custom origin distribution",
+        "Enabled": True,
+    }
+
+
+def _first_distribution_origin(config_or_summary):
+    origins = config_or_summary["Origins"]
+    assert origins["Quantity"] == 1
+    return origins["Items"][0]
 
 
 def test_cloudfront_create_distribution(cloudfront):
@@ -105,6 +151,41 @@ def test_cloudfront_get_distribution_config(cloudfront):
     assert resp["ETag"] == etag
     assert resp["DistributionConfig"]["Comment"] == "getcfg-test"
     assert resp["DistributionConfig"]["OriginGroups"]["Quantity"] == 0
+
+
+def test_cloudfront_origin_configuration_round_trips(cloudfront):
+    cfg = _custom_origin_distribution_config(f"cf-origin-{_uuid_mod.uuid4().hex[:12]}")
+    create_resp = cloudfront.create_distribution(DistributionConfig=cfg)
+    dist_id = create_resp["Distribution"]["Id"]
+
+    get_resp = cloudfront.get_distribution(Id=dist_id)
+    get_origin = _first_distribution_origin(get_resp["Distribution"]["DistributionConfig"])
+    assert get_origin["Id"] == "custom-origin"
+    assert get_origin["DomainName"] == "origin.example.com"
+    assert get_origin["OriginPath"] == "/app"
+    assert get_origin["CustomHeaders"]["Items"][0]["HeaderValue"] == "yes"
+    assert get_origin["CustomOriginConfig"]["OriginProtocolPolicy"] == "https-only"
+    assert get_origin["CustomOriginConfig"]["OriginSslProtocols"]["Items"] == ["TLSv1.2"]
+
+    config_resp = cloudfront.get_distribution_config(Id=dist_id)
+    config_origin = _first_distribution_origin(config_resp["DistributionConfig"])
+    assert config_origin["CustomOriginConfig"]["HTTPPort"] == 80
+    assert config_origin["CustomOriginConfig"]["HTTPSPort"] == 443
+
+    list_resp = cloudfront.list_distributions()
+    summary = next(item for item in list_resp["DistributionList"]["Items"] if item["Id"] == dist_id)
+    summary_origin = _first_distribution_origin(summary)
+    assert summary_origin["CustomOriginConfig"]["OriginReadTimeout"] == 30
+    assert summary["DefaultCacheBehavior"]["TargetOriginId"] == "custom-origin"
+
+    updated_cfg = copy.deepcopy(cfg)
+    updated_cfg["Origins"]["Items"][0]["OriginPath"] = "/next"
+    update_resp = cloudfront.update_distribution(
+        DistributionConfig=updated_cfg,
+        Id=dist_id,
+        IfMatch=create_resp["ETag"],
+    )
+    assert update_resp["Distribution"]["DistributionConfig"]["Origins"]["Items"][0]["OriginPath"] == "/next"
 
 
 def test_cloudfront_update_distribution(cloudfront):
@@ -185,6 +266,60 @@ def test_cloudfront_create_invalidation(cloudfront):
     assert inv_resp["ResponseMetadata"]["HTTPStatusCode"] == 201
 
 
+def test_cloudfront_create_get_list_invalidation_idempotent(cloudfront):
+    cfg = {
+        **_CF_DIST_CONFIG,
+        "CallerReference": f"cf-inv-basic-{_uuid_mod.uuid4().hex[:12]}",
+        "Comment": "inv-basic-test",
+    }
+    create_resp = cloudfront.create_distribution(DistributionConfig=cfg)
+    dist_id = create_resp["Distribution"]["Id"]
+    caller_ref = f"inv-basic-{_uuid_mod.uuid4().hex[:12]}"
+
+    resp = cloudfront.create_invalidation(
+        DistributionId=dist_id,
+        InvalidationBatch={
+            "Paths": {
+                "Quantity": 2,
+                "Items": ["/index.html", "/assets/*"],
+            },
+            "CallerReference": caller_ref,
+        },
+    )
+
+    invalidation = resp["Invalidation"]
+    invalidation_id = invalidation["Id"]
+    assert invalidation_id.startswith("I")
+    assert invalidation["Status"] == "Completed"
+    assert invalidation["InvalidationBatch"]["CallerReference"] == caller_ref
+    assert invalidation["InvalidationBatch"]["Paths"]["Quantity"] == 2
+    assert "/index.html" in invalidation["InvalidationBatch"]["Paths"]["Items"]
+
+    duplicate_resp = cloudfront.create_invalidation(
+        DistributionId=dist_id,
+        InvalidationBatch={
+            "Paths": {
+                "Quantity": 2,
+                "Items": ["/index.html", "/assets/*"],
+            },
+            "CallerReference": caller_ref,
+        },
+    )
+    assert duplicate_resp["Invalidation"]["Id"] == invalidation_id
+
+    get_resp = cloudfront.get_invalidation(
+        DistributionId=dist_id,
+        Id=invalidation_id,
+    )
+    assert get_resp["Invalidation"]["Id"] == invalidation_id
+    assert get_resp["Invalidation"]["Status"] == "Completed"
+
+    list_resp = cloudfront.list_invalidations(DistributionId=dist_id)
+    inv_list = list_resp["InvalidationList"]
+    assert inv_list["Quantity"] == 1
+    assert inv_list["Items"][0]["Id"] == invalidation_id
+
+
 def test_cloudfront_list_invalidations(cloudfront):
     cfg = {**_CF_DIST_CONFIG, "CallerReference": "cf-listinv-1", "Comment": "listinv-test"}
     create_resp = cloudfront.create_distribution(DistributionConfig=cfg)
@@ -224,6 +359,47 @@ def test_cloudfront_get_invalidation(cloudfront):
     assert inv["Id"] == inv_id
     assert inv["Status"] == "Completed"
     assert "/getinv-path" in inv["InvalidationBatch"]["Paths"]["Items"]
+
+
+def test_cloudfront_get_missing_invalidation_returns_error(cloudfront):
+    cfg = {
+        **_CF_DIST_CONFIG,
+        "CallerReference": f"cf-inv-missing-{_uuid_mod.uuid4().hex[:12]}",
+        "Comment": "inv-missing-test",
+    }
+    create_resp = cloudfront.create_distribution(DistributionConfig=cfg)
+    dist_id = create_resp["Distribution"]["Id"]
+
+    with pytest.raises(ClientError) as exc:
+        cloudfront.get_invalidation(
+            DistributionId=dist_id,
+            Id="IMISSING1234567",
+        )
+    assert exc.value.response["Error"]["Code"] == "NoSuchInvalidation"
+
+
+def test_cloudfront_create_invalidation_same_caller_reference_different_paths_errors(cloudfront):
+    cfg = {
+        **_CF_DIST_CONFIG,
+        "CallerReference": f"cf-inv-conflict-{_uuid_mod.uuid4().hex[:12]}",
+        "Comment": "inv-conflict-test",
+    }
+    create_resp = cloudfront.create_distribution(DistributionConfig=cfg)
+    dist_id = create_resp["Distribution"]["Id"]
+    caller_ref = f"inv-conflict-{_uuid_mod.uuid4().hex[:12]}"
+
+    cloudfront.create_invalidation(
+        DistributionId=dist_id,
+        InvalidationBatch={"Paths": {"Quantity": 1, "Items": ["/one"]}, "CallerReference": caller_ref},
+    )
+
+    with pytest.raises(ClientError) as exc:
+        cloudfront.create_invalidation(
+            DistributionId=dist_id,
+            InvalidationBatch={"Paths": {"Quantity": 1, "Items": ["/two"]}, "CallerReference": caller_ref},
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidationBatchAlreadyExists"
+    assert cloudfront.list_invalidations(DistributionId=dist_id)["InvalidationList"]["Quantity"] == 1
 
 
 def test_cloudfront_tags(cloudfront):

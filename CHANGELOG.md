@@ -7,10 +7,28 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
-## [1.3.47] — 2026-05-22
+## [1.3.48] — 2026-05-24
+
+### Added
+- **S3 `GetObjectAcl` and `PutObjectAcl`** — both `?acl` subresource operations are now implemented. `GetObjectAcl` returns the stored policy or, if none has been set, the AWS default of a single `FULL_CONTROL` Grant to the request's account-id owner. `PutObjectAcl` accepts either a canned ACL via the `x-amz-acl` header (`private`, `public-read`, `public-read-write`, `authenticated-read`, `aws-exec-read`, `bucket-owner-read`, `bucket-owner-full-control`) or a full `<AccessControlPolicy>` XML body; invalid canned values return `InvalidArgument` and malformed bodies return `MalformedACLError`. As with retention, legal-hold and bucket policies, the policy is stored and round-tripped but not enforced on the data plane. `NoSuchKey` returned for missing keys, matching the only error modeled in botocore. Reported by @smpial.
 
 ### Fixed
-- **S3 `DeleteObjects`** — Objects deleted in a batch will now be deleted from disk, much like `DeleteObject`.
+- **CloudFront distribution origin configuration** — `ListDistributions` now includes origin configuration from the stored distribution config, so custom origins round-trip consistently across create, get, list, and update flows.
+- **RDS persistence-restore module-import race** — the v1.3.47 restore-respawn threads called `_get_docker()` which was defined further down in the same module, so a thread reaching the lookup before the parser finished raised `NameError: name '_get_docker' is not defined` and stranded the restored instance in `creating`. The `load_state("rds")` block now runs at the bottom of the module, after every helper the restore threads can touch. Reported by @doodaz.
+
+---
+
+## [1.3.47] — 2026-05-23
+
+### Added
+- **CloudFormation nested stacks** — `AWS::CloudFormation::Stack` resources now provision their child template (fetched from `TemplateURL`), pass `Parameters` through, expose child `Outputs` via `Fn::GetAtt: [Nested, Outputs.<Name>]`, and cascade delete/update with the parent. `Ref` of the nested resource resolves to the child stack ARN, matching real AWS. Reported by @jayalfredprufrock.
+
+### Fixed
+- **CloudFront invalidations** — repeated `CreateInvalidation` calls with the same `CallerReference` now return the existing invalidation for that distribution; path comparison is set-based so re-submitting the same paths in a different order is treated as idempotent rather than as a divergent batch. Contributed by @CoffeeRaptor.
+- **S3 `DeleteObjects`** — objects deleted in a batch are now removed from disk, mirroring `DeleteObject`. Contributed by @parafoxia.
+- **RDS persistence-restore** — backing Docker containers are now respawned for persisted DB instances at restart, with status flowing `creating → available/failed` based on container liveness instead of staying frozen as zombie metadata. Per-instance threads now carry the original account context so multi-tenant restores land writes on the correct account. Reported by @doodaz.
+- **Cognito `/oauth2/idpresponse` and `/saml2/idpresponse`** — distinct error messages and a server-side WARNING log when the OIDC `state` / SAML `RelayState` doesn't match any pending authorize flow, so configuration drift (expired or unknown state) is diagnosable without staring at an opaque `InvalidParameterException`. Reported by @ocr-lasagna.
+- **Cognito `/{poolId}/.well-known/jwks.json` and `/{poolId}/.well-known/openid-configuration`** no longer shadow S3 — these endpoints now fall through to the S3 handler when the pool prefix doesn't match a registered user pool, so apps storing their own `.well-known/*` documents in an S3 bucket get the actual object back instead of a fake Cognito JWKS. Real AWS only serves these for actual pools.
 
 ---
 
