@@ -6,16 +6,14 @@ Routes SQL to real database containers managed by the RDS service emulator.
 
 import json
 import logging
-import os
 import re
 import threading
 import uuid
 
-from ministack.core.responses import AccountScopedDict, error_response_json, get_account_id, get_region, json_response
+from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.responses import AccountScopedDict, error_response_json, json_response
 
 logger = logging.getLogger("rds-data")
-
-REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
 # Active transactions: txn_id -> {conn, engine, resourceArn, database}
 _transactions: dict = {}
@@ -72,10 +70,16 @@ def _stub_success():
 
 def _cluster_id_from_arn(resource_arn):
     """Extract cluster identifier from an ARN."""
-    parts = resource_arn.split(":")
-    if len(parts) >= 7:
-        return parts[6]
-    return resource_arn
+    try:
+        spec = parse_arn(resource_arn)
+    except ArnParseError:
+        return resource_arn
+    if spec.service != "rds":
+        return resource_arn
+    _resource_type, sep, resource_id = spec.resource.partition(":")
+    if not sep:
+        return resource_arn
+    return resource_id
 
 
 _CREATE_DB_RE = re.compile(
@@ -225,25 +229,26 @@ def _resolve_cluster(resource_arn):
     """Find RDS cluster and a member instance from a resourceArn."""
     from ministack.services import rds
 
-    # Parse ARN: arn:aws:rds:REGION:ACCOUNT:cluster:IDENTIFIER
-    parts = resource_arn.split(":")
-    if len(parts) >= 7 and parts[5] == "cluster":
-        cluster_id = parts[6]
-    elif len(parts) >= 7 and parts[5] == "db":
-        # Instance ARN: arn:aws:rds:REGION:ACCOUNT:db:IDENTIFIER
-        instance_id = parts[6]
-        instance = rds._instances.get(instance_id)
+    parsed = rds._parse_rds_arn(resource_arn)
+    if not parsed:
+        return None, None
+
+    _spec, resource_type, _resource_id = parsed
+    if resource_type == "db":
+        instance = rds._resolve_instance(resource_arn)
         if instance:
             return instance, instance.get("Engine", "postgres")
         return None, None
-    else:
+
+    if resource_type != "cluster":
         return None, None
 
-    cluster = rds._clusters.get(cluster_id)
+    cluster = rds._resolve_cluster(resource_arn)
     if not cluster:
         return None, None
 
     engine = cluster.get("Engine", "postgres")
+    cluster_id = cluster["DBClusterIdentifier"]
 
     # Find an instance belonging to this cluster
     for inst in rds._instances.values():
