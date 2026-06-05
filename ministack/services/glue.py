@@ -11,6 +11,7 @@ scripts or when Docker is unavailable.
 Crawlers transition through RUNNING state with a configurable timer.
 """
 
+import contextvars
 import copy
 import fnmatch
 import json
@@ -109,6 +110,7 @@ _classifiers = AccountScopedDict()
 _triggers = AccountScopedDict()     # trigger_name -> trigger dict
 _workflows = AccountScopedDict()    # workflow_name -> workflow dict
 _workflow_runs = AccountScopedDict() # workflow_name -> [run, ...]
+_user_defined_functions = AccountScopedDict()  # "db_name/function_name" -> udf dict
 
 _ALL_STATE = {
     "databases": _databases,
@@ -125,6 +127,7 @@ _ALL_STATE = {
     "triggers": _triggers,
     "workflows": _workflows,
     "workflow_runs": _workflow_runs,
+    "user_defined_functions": _user_defined_functions,
 }
 
 
@@ -183,6 +186,7 @@ async def handle_request(method, path, headers, body, query_params):
         "GetPartitions": _get_partitions,
         "BatchCreatePartition": _batch_create_partition,
         "BatchGetPartition": _batch_get_partition,
+        "BatchUpdatePartition": _batch_update_partition,
         # Partition Indexes
         "CreatePartitionIndex": _create_partition_index,
         "GetPartitionIndexes": _get_partition_indexes,
@@ -236,6 +240,12 @@ async def handle_request(method, path, headers, body, query_params):
         "DeleteWorkflow": _delete_workflow,
         "UpdateWorkflow": _update_workflow,
         "StartWorkflowRun": _start_workflow_run,
+        # User Defined Functions
+        "CreateUserDefinedFunction": _create_user_defined_function,
+        "UpdateUserDefinedFunction": _update_user_defined_function,
+        "DeleteUserDefinedFunction": _delete_user_defined_function,
+        "GetUserDefinedFunction": _get_user_defined_function,
+        "GetUserDefinedFunctions": _get_user_defined_functions,
         # Tags
         "TagResource": _tag_resource,
         "UntagResource": _untag_resource,
@@ -265,6 +275,8 @@ def _create_database(data):
         "CreateTime": int(time.time()),
         "CatalogId": get_account_id(),
     }
+    if data.get("Tags"):
+        _tags[_arn("database", name)] = dict(data["Tags"])
     return json_response({})
 
 
@@ -273,6 +285,7 @@ def _delete_database(data):
     if name not in _databases:
         return error_response_json("EntityNotFoundException", f"Database {name} not found", 400)
     del _databases[name]
+    _tags.pop(_arn("database", name), None)
     keys_to_del = [k for k in _tables if k.startswith(f"{name}/")]
     for k in keys_to_del:
         del _tables[k]
@@ -334,6 +347,10 @@ def _create_table(data):
         "IsMultiDialectView": table_input.get("IsMultiDialectView"),
         "IsRegisteredWithLakeFormation": False,
         "CatalogId": get_account_id(),
+        # AWS Glue exposes a monotonically-increasing VersionId per table for
+        # optimistic concurrency on UpdateTable. Stored as a string per the
+        # botocore Table output shape.
+        "VersionId": "1",
     }
     return json_response({})
 
@@ -376,6 +393,17 @@ def _update_table(data):
     key = f"{db_name}/{name}"
     if key not in _tables:
         return error_response_json("EntityNotFoundException", f"Table {name} not found", 400)
+    # Optimistic-concurrency check: if the caller passes VersionId, it must
+    # match the table's current VersionId. Real AWS Glue rejects stale writes
+    # with ConcurrentModificationException. Issue #1183.
+    requested_version = data.get("VersionId")
+    current_version = _tables[key].get("VersionId", "1")
+    if requested_version is not None and str(requested_version) != current_version:
+        return error_response_json(
+            "ConcurrentModificationException",
+            f"Table {name} was modified by another process. Expected VersionId={current_version}, got {requested_version}.",
+            400,
+        )
     safe_keys = {"Description", "Owner", "StorageDescriptor", "PartitionKeys",
                  "TableType", "Parameters", "ViewOriginalText", "ViewExpandedText",
                  "ViewDefinition", "IsMultiDialectView"}
@@ -383,6 +411,10 @@ def _update_table(data):
         if k in table_input:
             _tables[key][k] = table_input[k]
     _tables[key]["UpdateTime"] = int(time.time())
+    try:
+        _tables[key]["VersionId"] = str(int(current_version) + 1)
+    except (TypeError, ValueError):
+        _tables[key]["VersionId"] = "1"
     return json_response({})
 
 
@@ -502,6 +534,41 @@ def _batch_get_partition(data):
         else:
             unprocessed.append(entry)
     return json_response({"Partitions": partitions, "UnprocessedKeys": unprocessed})
+
+
+def _batch_update_partition(data):
+    db_name = data.get("DatabaseName")
+    table_name = data.get("TableName")
+    key = f"{db_name}/{table_name}"
+    if key not in _tables:
+        return error_response_json("EntityNotFoundException",
+            f"Table {table_name} not found in {db_name}", 400)
+    parts = _partitions.get(key, [])
+    errors = []
+    for entry in data.get("Entries", []):
+        values = entry.get("PartitionValueList", [])
+        partition_input = entry.get("PartitionInput", {})
+        target = None
+        for p in parts:
+            if p.get("Values") == values:
+                target = p
+                break
+        if target is None:
+            errors.append({"PartitionValueList": values, "ErrorDetail": {
+                "ErrorCode": "EntityNotFoundException",
+                "ErrorMessage": "Partition not found"}})
+            continue
+        creation_time = target.get("CreationTime")
+        target.clear()
+        target.update({
+            **partition_input,
+            "DatabaseName": db_name,
+            "TableName": table_name,
+            "CreationTime": creation_time,
+            "LastAccessTime": int(time.time()),
+            "CatalogId": get_account_id(),
+        })
+    return json_response({"Errors": errors})
 
 
 # ---- Partition Indexes ----
@@ -658,7 +725,12 @@ def _start_crawler(data):
             }
             logger.info("Glue: Crawler %s finished after %ss", name, CRAWLER_RUN_SECONDS)
 
-    timer = threading.Timer(CRAWLER_RUN_SECONDS, _finish_crawl)
+    # threading.Timer (like threading.Thread) does NOT copy contextvars, so
+    # without this snapshot _finish_crawl runs under the default account and the
+    # account-scoped _crawlers guard never matches — the crawler would hang in
+    # RUNNING forever for non-default accounts. See issue #639 / stepfunctions.
+    ctx = contextvars.copy_context()
+    timer = threading.Timer(CRAWLER_RUN_SECONDS, lambda: ctx.run(_finish_crawl))
     timer.daemon = True
     timer.start()
 
@@ -778,8 +850,10 @@ def _resolve_script(script_location):
         parts = stripped.split("/", 1)
         bucket = parts[0]
         key = parts[1] if len(parts) > 1 else ""
-        # Check on-disk first
-        local_path = os.path.join(S3_DATA_DIR, bucket, key)
+        # Check on-disk first. Objects are persisted account-scoped at
+        # DATA_DIR/<account>/<bucket>/<key> (see s3._object_disk_path), so the
+        # account id MUST be part of the lookup path or it never matches.
+        local_path = os.path.join(S3_DATA_DIR, get_account_id(), bucket, key)
         if os.path.exists(local_path):
             return local_path
         # Fetch from in-memory S3
@@ -868,7 +942,12 @@ def _start_job_run(data):
         run["ExecutionTime"] = int(run["CompletedOn"] - run["StartedOn"])
         run["LastModifiedOn"] = int(time.time())
 
-    thread = threading.Thread(target=_execute, daemon=True)
+    # threading.Thread does NOT copy contextvars, so without this snapshot the
+    # worker would run under the default account and fail to resolve the
+    # account-scoped on-disk script (and AccountScopedDict lookups). Carry the
+    # request's account/region into the thread. See issue #639 / stepfunctions.
+    ctx = contextvars.copy_context()
+    thread = threading.Thread(target=ctx.run, args=(_execute,), daemon=True)
     thread.start()
 
     return json_response({"JobRunId": run_id})
@@ -1363,6 +1442,99 @@ def _start_workflow_run(data):
     }
     _workflow_runs.setdefault(name, []).append(run)
     return json_response({"RunId": run_id})
+
+
+# ---- User Defined Functions ----
+
+def _udf_key(db_name: str, func_name: str) -> str:
+    return f"{db_name}/{func_name}"
+
+
+def _udf_record(db_name: str, fn_input: dict) -> dict:
+    """Build a UserDefinedFunction record matching the botocore output shape:
+    UserDefinedFunction { FunctionName, DatabaseName, ClassName, OwnerName,
+    OwnerType, CreateTime, ResourceUris, CatalogId }."""
+    return {
+        "FunctionName": fn_input.get("FunctionName"),
+        "DatabaseName": db_name,
+        "ClassName": fn_input.get("ClassName"),
+        "OwnerName": fn_input.get("OwnerName"),
+        "OwnerType": fn_input.get("OwnerType"),
+        "CreateTime": int(time.time()),
+        "ResourceUris": fn_input.get("ResourceUris", []),
+        "CatalogId": get_account_id(),
+    }
+
+
+def _create_user_defined_function(data):
+    db_name = data.get("DatabaseName")
+    if db_name not in _databases:
+        return error_response_json("EntityNotFoundException", f"Database {db_name} not found.", 400)
+    fn_input = data.get("FunctionInput") or {}
+    func_name = fn_input.get("FunctionName")
+    if not func_name:
+        return error_response_json("InvalidInputException", "FunctionInput.FunctionName is required", 400)
+    if not fn_input.get("ClassName"):
+        return error_response_json("InvalidInputException", "FunctionInput.ClassName is required", 400)
+    key = _udf_key(db_name, func_name)
+    if key in _user_defined_functions:
+        return error_response_json("AlreadyExistsException", f"User-defined function {func_name} already exists", 400)
+    _user_defined_functions[key] = _udf_record(db_name, fn_input)
+    return json_response({})
+
+
+def _update_user_defined_function(data):
+    db_name = data.get("DatabaseName")
+    func_name = data.get("FunctionName")
+    key = _udf_key(db_name, func_name)
+    if key not in _user_defined_functions:
+        return error_response_json("EntityNotFoundException", f"User-defined function {func_name} not found in {db_name}", 400)
+    fn_input = data.get("FunctionInput") or {}
+    existing = _user_defined_functions[key]
+    for field in ("ClassName", "OwnerName", "OwnerType", "ResourceUris"):
+        if field in fn_input:
+            existing[field] = fn_input[field]
+    # AWS allows renaming the function via FunctionInput.FunctionName.
+    new_name = fn_input.get("FunctionName")
+    if new_name and new_name != func_name:
+        existing["FunctionName"] = new_name
+        _user_defined_functions[_udf_key(db_name, new_name)] = existing
+        del _user_defined_functions[key]
+    return json_response({})
+
+
+def _delete_user_defined_function(data):
+    db_name = data.get("DatabaseName")
+    func_name = data.get("FunctionName")
+    key = _udf_key(db_name, func_name)
+    if key not in _user_defined_functions:
+        return error_response_json("EntityNotFoundException", f"User-defined function {func_name} not found in {db_name}", 400)
+    del _user_defined_functions[key]
+    return json_response({})
+
+
+def _get_user_defined_function(data):
+    db_name = data.get("DatabaseName")
+    func_name = data.get("FunctionName")
+    key = _udf_key(db_name, func_name)
+    udf = _user_defined_functions.get(key)
+    if not udf:
+        return error_response_json("EntityNotFoundException", f"User-defined function {func_name} not found in {db_name}", 400)
+    return json_response({"UserDefinedFunction": udf})
+
+
+def _get_user_defined_functions(data):
+    db_name = data.get("DatabaseName")
+    pattern = data.get("Pattern") or ""
+    # Real AWS accepts DatabaseName="*" or omitted to span all databases in the
+    # catalog. Botocore marks DatabaseName as optional.
+    if db_name and db_name != "*":
+        items = [u for k, u in _user_defined_functions.items() if k.startswith(f"{db_name}/")]
+    else:
+        items = list(_user_defined_functions.values())
+    if pattern:
+        items = [u for u in items if _simple_glob_match(pattern, u.get("FunctionName", ""))]
+    return json_response({"UserDefinedFunctions": items})
 
 
 # ---- Tags ----
