@@ -841,6 +841,27 @@ def _append_challenge_to_session(session: dict, challenge_name: str,
     session["last_challenge_metadata"] = challenge_metadata
 
 
+def _update_pending_challenge_result(session: dict, challenge_result: bool | None) -> None:
+    """Record a VerifyAuthChallenge result on the round it belongs to.
+
+    AWS records ONE ChallengeResult per CUSTOM_AUTH round, carrying BOTH the
+    metadata (set by CreateAuthChallenge) and the result (from
+    VerifyAuthChallengeResponse). Update the pending round's result in place
+    rather than appending a second, metadata-less entry that would split the
+    round across two session records — a consumer reading challengeMetadata and
+    challengeResult from the same element could then never identify the step.
+
+    Falls back to appending only when there is no pending round (empty or
+    malformed history), preserving the prior behaviour for that edge case.
+    """
+    challenges = session["challenges"]
+    if challenges and challenges[-1].get("challengeResult") is None:
+        challenges[-1]["challengeResult"] = challenge_result
+    else:
+        _append_challenge_to_session(session, "CUSTOM_CHALLENGE", challenge_result,
+                                     None, {}, {})
+
+
 def _build_session_list(session: dict) -> list:
     """Build the session list for Lambda events (challenge history).
     
@@ -2336,10 +2357,10 @@ def _admin_initiate_auth(data):
                     "DefineAuthChallenge returned unexpected response — not issuing tokens, "
                     "not failing auth, and no challengeName set", 400)
 
-        # Add a pending challenge to session before checking if define/create need to happen
-        _append_challenge_to_session(session, "CUSTOM_CHALLENGE", None, None, {}, {})
-
-        # Invoke CreateAuthChallenge
+        # Invoke CreateAuthChallenge. AWS passes an EMPTY session array to the
+        # first CreateAuthChallenge (the round being created is not itself a
+        # session entry), so append the pending round AFTER Create runs —
+        # mirroring the round-2+ path in RespondToAuthChallenge.
         create_result, err = _invoke_create_auth_challenge_trigger(
             pid, cid, username, user_attrs, session, client_metadata
         )
@@ -2359,14 +2380,9 @@ def _admin_initiate_auth(data):
             private_params = {"challenge": "PROVIDE_AUTH_PARAMETERS"}
             challenge_metadata = None
 
-        # Update session with challenge parameters
-        if session["challenges"]:
-            session["challenges"][-1].update({
-                "publicChallengeParameters": public_params,
-                "privateChallengeParameters": private_params,
-                "challengeMetadata": challenge_metadata or session["challenges"][-1].get("challengeMetadata"),
-            })
-            session["last_challenge_metadata"] = challenge_metadata
+        # Append the pending round with the parameters from CreateAuthChallenge.
+        _append_challenge_to_session(session, "CUSTOM_CHALLENGE", None, challenge_metadata,
+                                    public_params, private_params)
 
         # Return challenge to client
         return json_response({
@@ -2434,8 +2450,9 @@ def _admin_respond_to_auth_challenge(data):
             # No Lambda configured — auto-fail (caller must provide answer)
             answer_correct = False
 
-        # Append verify result to session
-        _append_challenge_to_session(session, "CUSTOM_CHALLENGE", answer_correct, None, {}, {})
+        # Record the verify result on the pending round — AWS keeps ONE merged
+        # ChallengeResult per round (metadata + result), not two split entries.
+        _update_pending_challenge_result(session, answer_correct)
 
         # Invoke DefineAuthChallenge (evaluates full session history)
         define_result, err = _invoke_define_auth_challenge_trigger(
@@ -2682,10 +2699,10 @@ def _initiate_auth(data):
                     "DefineAuthChallenge returned unexpected response — not issuing tokens, "
                     "not failing auth, and no challengeName set", 400)
 
-        # Add a pending challenge to session before checking if define/create need to happen
-        _append_challenge_to_session(session, "CUSTOM_CHALLENGE", None, None, {}, {})
-
-        # Invoke CreateAuthChallenge
+        # Invoke CreateAuthChallenge. AWS passes an EMPTY session array to the
+        # first CreateAuthChallenge (the round being created is not itself a
+        # session entry), so append the pending round AFTER Create runs —
+        # mirroring the round-2+ path in RespondToAuthChallenge.
         create_result, err = _invoke_create_auth_challenge_trigger(
             pid, cid, username, user_attrs, session, client_metadata
         )
@@ -2705,14 +2722,9 @@ def _initiate_auth(data):
             private_params = {"challenge": "PROVIDE_AUTH_PARAMETERS"}
             challenge_metadata = None
 
-        # Update session with challenge parameters
-        if session["challenges"]:
-            session["challenges"][-1].update({
-                "publicChallengeParameters": public_params,
-                "privateChallengeParameters": private_params,
-                "challengeMetadata": challenge_metadata or session["challenges"][-1].get("challengeMetadata"),
-            })
-            session["last_challenge_metadata"] = challenge_metadata
+        # Append the pending round with the parameters from CreateAuthChallenge.
+        _append_challenge_to_session(session, "CUSTOM_CHALLENGE", None, challenge_metadata,
+                                    public_params, private_params)
 
         # Return challenge to client
         return json_response({
@@ -2785,8 +2797,9 @@ def _respond_to_auth_challenge(data):
             # No Lambda configured — auto-fail (caller must provide answer)
             answer_correct = False
 
-        # Append verify result to session
-        _append_challenge_to_session(session, "CUSTOM_CHALLENGE", answer_correct, None, {}, {})
+        # Record the verify result on the pending round — AWS keeps ONE merged
+        # ChallengeResult per round (metadata + result), not two split entries.
+        _update_pending_challenge_result(session, answer_correct)
 
         # Invoke DefineAuthChallenge (evaluates full session history)
         define_result, err = _invoke_define_auth_challenge_trigger(
