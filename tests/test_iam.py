@@ -737,6 +737,105 @@ def test_iam_aws_managed_attachment_count_persists_through_state_round_trip():
     assert _iam._aws_managed_attachment_counts.get(arn) == 2
 
 
+# ── Service last accessed (Access Advisor) ────────────────────────────
+
+
+def test_iam_service_last_accessed_job(iam):
+    # Use the default account user
+    resp_user = iam.create_user(UserName="sla-test-user")
+    user_arn = resp_user["User"]["Arn"]
+    try:
+        gen_resp = iam.generate_service_last_accessed_details(Arn=user_arn)
+        job_id = gen_resp["JobId"]
+        assert job_id
+
+        get_resp = iam.get_service_last_accessed_details(JobId=job_id)
+        assert get_resp["JobStatus"] == "COMPLETED"
+        assert "ServicesLastAccessed" in get_resp
+        assert isinstance(get_resp["ServicesLastAccessed"], list)
+    finally:
+        iam.delete_user(UserName="sla-test-user")
+# ── SAML providers + ListOpenIDConnectProviders ──────────────────────
+
+
+def test_iam_saml_provider_crud(iam):
+    name = "saml-test-provider"
+    # botocore requires ≥ 1000 chars for SAMLMetadataDocument (client-side validation)
+    metadata = "<EntityDescriptor>" + "x" * 990 + "</EntityDescriptor>"
+    resp = iam.create_saml_provider(Name=name, SAMLMetadataDocument=metadata)
+    arn = resp["SAMLProviderArn"]
+    assert f":saml-provider/{name}" in arn
+
+    providers = iam.list_saml_providers()["SAMLProviderList"]
+    assert any(p["Arn"] == arn for p in providers)
+
+    get_resp = iam.get_saml_provider(SAMLProviderArn=arn)
+    assert get_resp["SAMLMetadataDocument"] == metadata
+
+    iam.delete_saml_provider(SAMLProviderArn=arn)
+    with pytest.raises(iam.exceptions.NoSuchEntityException):
+        iam.get_saml_provider(SAMLProviderArn=arn)
+
+
+def test_iam_list_oidc_providers(iam):
+    resp = iam.create_open_id_connect_provider(
+        Url="https://oidc-list-test.example.com",
+        ClientIDList=["aud"],
+        ThumbprintList=["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa00"],
+    )
+    arn = resp["OpenIDConnectProviderArn"]
+    try:
+        providers = iam.list_open_id_connect_providers()["OpenIDConnectProviderList"]
+        assert any(p["Arn"] == arn for p in providers)
+    finally:
+        iam.delete_open_id_connect_provider(OpenIDConnectProviderArn=arn)
+# ── GetAccountAuthorizationDetails ───────────────────────────────────
+
+
+def test_iam_account_authorization_details_all(iam):
+    policy_doc = json.dumps({"Version": "2012-10-17", "Statement": []})
+    assume_doc = json.dumps({"Version": "2012-10-17", "Statement": []})
+
+    pol = iam.create_policy(PolicyName="aad-test-policy", PolicyDocument=policy_doc)
+    pol_arn = pol["Policy"]["Arn"]
+    iam.create_user(UserName="aad-test-user")
+    iam.attach_user_policy(UserName="aad-test-user", PolicyArn=pol_arn)
+    iam.create_group(GroupName="aad-test-group")
+    iam.add_user_to_group(UserName="aad-test-user", GroupName="aad-test-group")
+    iam.create_role(RoleName="aad-test-role", AssumeRolePolicyDocument=assume_doc)
+    try:
+        resp = iam.get_account_authorization_details()
+
+        user_names = [u["UserName"] for u in resp.get("UserDetailList", [])]
+        assert "aad-test-user" in user_names
+
+        role_names = [r["RoleName"] for r in resp.get("RoleDetailList", [])]
+        assert "aad-test-role" in role_names
+
+        policy_arns = [p["Arn"] for p in resp.get("Policies", [])]
+        assert pol_arn in policy_arns
+    finally:
+        iam.detach_user_policy(UserName="aad-test-user", PolicyArn=pol_arn)
+        iam.remove_user_from_group(UserName="aad-test-user", GroupName="aad-test-group")
+        iam.delete_user(UserName="aad-test-user")
+        iam.delete_group(GroupName="aad-test-group")
+        iam.delete_role(RoleName="aad-test-role")
+        iam.delete_policy(PolicyArn=pol_arn)
+
+
+def test_iam_account_authorization_details_filter(iam):
+    assume_doc = json.dumps({"Version": "2012-10-17", "Statement": []})
+    iam.create_user(UserName="aad-filter-user")
+    iam.create_role(RoleName="aad-filter-role", AssumeRolePolicyDocument=assume_doc)
+    try:
+        resp = iam.get_account_authorization_details(Filter=["Role"])
+        # UserDetailList should be empty when filtering for Role only
+        assert resp.get("UserDetailList", []) == []
+        role_names = [r["RoleName"] for r in resp.get("RoleDetailList", [])]
+        assert "aad-filter-role" in role_names
+    finally:
+        iam.delete_user(UserName="aad-filter-user")
+        iam.delete_role(RoleName="aad-filter-role")
 # ── Virtual MFA devices ───────────────────────────────────────────────
 
 
