@@ -930,7 +930,7 @@ def _invoke_target(target, event, rule):
 
     input_transformer = target.get("InputTransformer")
     if input_transformer:
-        event_payload = _apply_input_transformer(input_transformer, event)
+        event_payload = _apply_input_transformer(input_transformer, event, rule)
     elif target.get("Input"):
         event_payload = target["Input"]
     elif target.get("InputPath"):
@@ -960,7 +960,7 @@ def _invoke_target(target, event, rule):
         logger.error("EventBridge target dispatch error for %s: %s", arn, e)
 
 
-def _apply_input_transformer(transformer, event):
+def _apply_input_transformer(transformer, event, rule=None):
     input_paths = transformer.get("InputPathsMap", {})
     template = transformer.get("InputTemplate", "")
 
@@ -970,6 +970,7 @@ def _apply_input_transformer(transformer, event):
         full = {}
 
     event_envelope = {
+        "version": "0",
         "source": event.get("Source", ""),
         "detail-type": event.get("DetailType", ""),
         "detail": full,
@@ -991,6 +992,17 @@ def _apply_input_transformer(transformer, event):
             replacements[var_name] = val if isinstance(val, str) else json.dumps(val)
         except (KeyError, TypeError, IndexError):
             replacements[var_name] = ""
+
+    reserved = {
+        "aws.events.event.json": json.dumps(event_envelope),
+        "aws.events.event": json.dumps({k: v for k, v in event_envelope.items() if k != "detail"}),
+        "aws.events.event.ingestion-time": event_envelope.get("time", ""),
+    }
+    if rule:
+        reserved["aws.events.rule-name"] = rule.get("Name", "")
+        reserved["aws.events.rule-arn"] = rule.get("Arn", "")
+    for k, v in reserved.items():
+        replacements.setdefault(k, v)
 
     result = template
     for var_name, val in replacements.items():
