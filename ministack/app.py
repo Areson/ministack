@@ -313,6 +313,11 @@ SERVICE_REGISTRY = {
     "inspector2": {"module": "inspector2"},
     "mq": {"module": "mq"},
     "s3tables": {"module": "s3tables"},
+    "bedrock": {"module": "bedrock"},
+    "bedrock-runtime": {"module": "bedrock_runtime"},
+    "bedrock-agent": {"module": "bedrock_agent"},
+    "bedrock-agent-runtime": {"module": "bedrock_agent_runtime"},
+    "kafka": {"module": "msk"},
 }
 
 SERVICE_HANDLERS = {
@@ -352,6 +357,11 @@ _state_map = {
     "mq": "mq",
     "s3tables": "s3tables",
     "lambda_durable": "lambda_durable",
+    "bedrock": "bedrock",
+    "bedrock_runtime": "bedrock_runtime",
+    "bedrock_agent": "bedrock_agent",
+    "bedrock_agent_runtime": "bedrock_agent_runtime",
+    "msk": "msk",
 }
 
 SERVICE_NAME_ALIASES = {
