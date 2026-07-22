@@ -2792,6 +2792,7 @@ def _cognito_user_pool_create(logical_id, props, stack_name):
             "AllowAdminCreateUserOnly": False,
             "UnusedAccountValidityDays": 7,
         }),
+        "LambdaConfig": props.get("LambdaConfig", {}),
         "Domain": None,
         "_clients": {},
         "_users": {},
