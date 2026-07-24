@@ -592,6 +592,89 @@ def test_scheduler_legacy_account_scoped_state_uses_resource_arn_region():
         set_request_region(original_region)
 
 
+@pytest.mark.parametrize(
+    "legacy_account_scoped",
+    [True, False],
+    ids=["legacy-account-scope", "current-region-scope"],
+)
+def test_mwaa_restore_preserves_resource_region_outside_boot_scope(
+    monkeypatch,
+    legacy_account_scoped,
+):
+    from types import SimpleNamespace
+
+    from ministack.core.responses import (
+        AccountRegionScopedDict,
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import mwaa as mod
+
+    class ImmediateThread:
+        def __init__(self, target, args, daemon):
+            self.target = target
+            self.args = args
+            self.daemon = daemon
+
+        def start(self):
+            self.target(*self.args)
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "111111111111"
+    boot_region = "us-east-1"
+    resource_region = "us-west-2"
+    env_name = "warm-boot-environment"
+    env = {
+        "Name": env_name,
+        "Arn": f"arn:aws:airflow:{resource_region}:{account_id}:environment/{env_name}",
+        "Status": "AVAILABLE",
+        "_docker_container_id": "stale-container",
+    }
+    restored = (
+        AccountScopedDict()
+        if legacy_account_scoped
+        else AccountRegionScopedDict()
+    )
+    if legacy_account_scoped:
+        restored._data[(account_id, env_name)] = env
+        persistence.save_state("mwaa", {"environments": restored})
+        loaded = persistence.load_state("mwaa")
+        assert isinstance(loaded["environments"], AccountScopedDict)
+        restored = loaded["environments"]
+    else:
+        restored._data[(account_id, resource_region, env_name)] = env
+
+    restart_args = []
+    monkeypatch.setattr(mod, "_get_docker", lambda: None)
+    monkeypatch.setattr(mod, "_start_airflow_container", lambda *args: restart_args.append(args))
+    monkeypatch.setattr(mod, "threading", SimpleNamespace(Thread=ImmediateThread))
+    mod.reset()
+    try:
+        set_request_account_id(account_id)
+        set_request_region(boot_region)
+        mod.restore_state({"environments": restored})
+
+        assert mod._environments.get_scoped(account_id, boot_region, env_name) is None
+        restored_env = mod._environments.get_scoped(
+            account_id,
+            resource_region,
+            env_name,
+        )
+        assert restored_env["Status"] == "CREATING"
+        assert restored_env["_docker_container_id"] is None
+        assert restart_args == [
+            (account_id, resource_region, env_name, restored_env)
+        ]
+    finally:
+        mod.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
 def test_pipes_round_trip():
     # Use a complete pipe record matching `register_pipe()` shape so the
     # background poller (which the restore path may start) doesn't blow up
