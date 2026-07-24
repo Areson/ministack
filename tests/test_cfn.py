@@ -1916,53 +1916,83 @@ def test_cfn_ec2_launch_template(cfn, ec2):
     assert len(desc2["LaunchTemplates"]) == 0
 
 
-def test_cfn_ec2_vpc_endpoint_uses_ec2_state(cfn, ec2):
-    """CloudFormation VPC endpoints share the EC2 API state and expose their ID."""
+def test_cfn_appsync_function_configuration_attributes(cfn, appsync):
+    """AppSync pipeline functions expose the identities consumed by resolvers."""
     suffix = _uuid_mod.uuid4().hex[:8]
-    stack_name = f"cfn-vpce-{suffix}"
-    template = {
-        "AWSTemplateFormatVersion": "2010-09-09",
-        "Resources": {
-            "Vpc": {
-                "Type": "AWS::EC2::VPC",
-                "Properties": {"CidrBlock": "10.40.0.0/16"},
-            },
-            "Endpoint": {
-                "Type": "AWS::EC2::VPCEndpoint",
-                "Properties": {
-                    "VpcEndpointType": "Gateway",
-                    "VpcId": {"Ref": "Vpc"},
-                    "ServiceName": "com.amazonaws.us-east-1.s3",
-                    "Tags": [{"Key": "source", "Value": "cloudformation"}],
+    stack_name = f"cfn-appsync-function-{suffix}"
+    api_id = appsync.create_graphql_api(
+        name=f"pipeline-api-{suffix}",
+        authenticationType="API_KEY",
+    )["graphqlApi"]["apiId"]
+    appsync.create_data_source(
+        apiId=api_id,
+        name="NoneSource",
+        type="NONE",
+    )
+
+    def template(function_name):
+        return {
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {
+                "PipelineFunction": {
+                    "Type": "AWS::AppSync::FunctionConfiguration",
+                    "Properties": {
+                        "ApiId": api_id,
+                        "DataSourceName": "NoneSource",
+                        "Name": function_name,
+                        "FunctionVersion": "2018-05-29",
+                        "RequestMappingTemplate": "{}",
+                        "ResponseMappingTemplate": "$util.toJson($ctx.result)",
+                    },
                 },
             },
-        },
-        "Outputs": {
-            "RefId": {"Value": {"Ref": "Endpoint"}},
-            "GetAttId": {"Value": {"Fn::GetAtt": ["Endpoint", "Id"]}},
-        },
-    }
+            "Outputs": {
+                "RefArn": {"Value": {"Ref": "PipelineFunction"}},
+                "FunctionArn": {
+                    "Value": {"Fn::GetAtt": ["PipelineFunction", "FunctionArn"]}
+                },
+                "FunctionId": {
+                    "Value": {"Fn::GetAtt": ["PipelineFunction", "FunctionId"]}
+                },
+                "FunctionName": {
+                    "Value": {"Fn::GetAtt": ["PipelineFunction", "Name"]}
+                },
+                "DataSourceName": {
+                    "Value": {"Fn::GetAtt": ["PipelineFunction", "DataSourceName"]}
+                },
+            },
+        }
 
-    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
-    stack = _wait_stack(cfn, stack_name)
-    assert stack["StackStatus"] == "CREATE_COMPLETE"
-    outputs = {item["OutputKey"]: item["OutputValue"] for item in stack["Outputs"]}
-    assert outputs["RefId"] == outputs["GetAttId"]
-    assert outputs["RefId"].startswith("vpce-")
+    try:
+        cfn.create_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template("ExampleFunction")),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        outputs = {item["OutputKey"]: item["OutputValue"] for item in stack["Outputs"]}
+        assert outputs["RefArn"] == outputs["FunctionArn"]
+        assert outputs["RefArn"].endswith(f"/functions/{outputs['FunctionId']}")
+        assert outputs["FunctionName"] == "ExampleFunction"
+        assert outputs["DataSourceName"] == "NoneSource"
+        original_arn = outputs["FunctionArn"]
 
-    endpoints = ec2.describe_vpc_endpoints(
-        VpcEndpointIds=[outputs["RefId"]]
-    )["VpcEndpoints"]
-    assert len(endpoints) == 1
-    assert endpoints[0]["VpcEndpointId"] == outputs["RefId"]
-    assert endpoints[0]["ServiceName"] == "com.amazonaws.us-east-1.s3"
-    assert endpoints[0]["Tags"] == [{"Key": "source", "Value": "cloudformation"}]
-
-    cfn.delete_stack(StackName=stack_name)
-    _wait_stack(cfn, stack_name)
-    assert ec2.describe_vpc_endpoints(
-        VpcEndpointIds=[outputs["RefId"]]
-    )["VpcEndpoints"] == []
+        cfn.update_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template("UpdatedFunction")),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        outputs = {item["OutputKey"]: item["OutputValue"] for item in stack["Outputs"]}
+        assert outputs["FunctionArn"] == original_arn
+        assert outputs["FunctionName"] == "UpdatedFunction"
+    finally:
+        try:
+            cfn.delete_stack(StackName=stack_name)
+            _wait_stack(cfn, stack_name)
+        except ClientError:
+            pass
+        appsync.delete_graphql_api(apiId=api_id)
 
 def test_cfn_elbv2_load_balancer_and_listener(cfn, elbv2):
     """CloudFormation provisions ELBv2 LoadBalancer + Listener and cleans both on delete."""

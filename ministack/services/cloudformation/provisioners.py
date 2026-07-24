@@ -2760,6 +2760,40 @@ def _appsync_ds_delete(physical_id, props):
         _appsync._data_sources.get(parts[0], {}).pop(parts[1], None)
 
 
+def _appsync_function_attributes(api_id, function_id, props):
+    function_arn = (
+        f"arn:aws:appsync:{get_region()}:{get_account_id()}:"
+        f"apis/{api_id}/functions/{function_id}"
+    )
+    return {
+        "DataSourceName": props.get("DataSourceName", ""),
+        "FunctionArn": function_arn,
+        "FunctionId": function_id,
+        "Name": props.get("Name", ""),
+    }
+
+
+def _appsync_function_create(logical_id, props, stack_name):
+    api_id = props.get("ApiId", "")
+    function_id = new_uuid().replace("-", "")[:26]
+    attrs = _appsync_function_attributes(api_id, function_id, props)
+    # Pipeline execution remains permissive; the CFN identity and documented
+    # attributes are enough for resolvers to reference the local function.
+    return attrs["FunctionArn"], attrs
+
+
+def _appsync_function_update(physical_id, old_props, new_props, stack_name):
+    if new_props.get("ApiId") != old_props.get("ApiId"):
+        return _appsync_function_create(physical_id, new_props, stack_name)
+    function_id = physical_id.rsplit("/", 1)[-1]
+    attrs = _appsync_function_attributes(new_props.get("ApiId", ""), function_id, new_props)
+    return physical_id, attrs
+
+
+def _appsync_function_delete(physical_id, props):
+    pass
+
+
 def _appsync_resolver_create(logical_id, props, stack_name):
     api_id = props.get("ApiId", "")
     type_name = props.get("TypeName", "Query")
@@ -5298,6 +5332,11 @@ _RESOURCE_HANDLERS = {
     "AWS::SNS::TopicPolicy": {"create": _sns_topic_policy_create, "delete": _sns_topic_policy_delete},
     "AWS::AppSync::GraphQLApi": {"create": _appsync_api_create, "delete": _appsync_api_delete},
     "AWS::AppSync::DataSource": {"create": _appsync_ds_create, "delete": _appsync_ds_delete},
+    "AWS::AppSync::FunctionConfiguration": {
+        "create": _appsync_function_create,
+        "update": _appsync_function_update,
+        "delete": _appsync_function_delete,
+    },
     "AWS::AppSync::Resolver": {"create": _appsync_resolver_create, "delete": _appsync_resolver_delete},
     "AWS::AppSync::GraphQLSchema": {"create": _appsync_schema_create},
     "AWS::AppSync::ApiKey": {"create": _appsync_apikey_create, "delete": _appsync_apikey_delete},
