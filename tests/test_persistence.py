@@ -666,6 +666,21 @@ def test_mwaa_restore_preserves_resource_region_outside_boot_scope(
         )
         assert restored_env["Status"] == "CREATING"
         assert restored_env["_docker_container_id"] is None
+        expected_volume_prefix = (
+            f"ministack-mwaa-{env_name}"
+            if legacy_account_scoped
+            else f"ministack-mwaa-{resource_region}-{env_name}"
+        )
+        if legacy_account_scoped:
+            assert restored_env["_docker_dags_volume_name"] == (
+                f"{expected_volume_prefix}-dags"
+            )
+            assert restored_env["_docker_db_volume_name"] == (
+                f"{expected_volume_prefix}-db"
+            )
+        else:
+            assert "_docker_dags_volume_name" not in restored_env
+            assert "_docker_db_volume_name" not in restored_env
         assert restart_args == [
             (account_id, resource_region, env_name, restored_env)
         ]
@@ -2095,6 +2110,42 @@ def test_mq_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path):
 
     monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
     assert persistence.load_state("mq") is None
+
+
+def test_mwaa_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path):
+    """A rollback binary must reject MWAA's regional schema instead of
+    accepting it as v2 and silently dropping every regional environment."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    environments = AccountRegionScopedDict()
+    environments.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "regional-environment",
+        {
+            "Name": "regional-environment",
+            "Arn": (
+                "arn:aws:airflow:us-west-2:000000000000:"
+                "environment/regional-environment"
+            ),
+        },
+    )
+    persistence.save_state("mwaa", {"environments": environments})
+
+    raw = _json.loads((tmp_path / "mwaa.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded_environments = persistence.load_state("mwaa")["environments"]
+    assert loaded_environments.get_scoped(
+        "000000000000", "us-west-2", "regional-environment"
+    )["Name"] == "regional-environment"
+
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("mwaa") is None
 
 
 def test_ses_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path):

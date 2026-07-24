@@ -64,6 +64,27 @@ def restore_state(data):
     envs_data = data.get("environments")
     if envs_data is None:
         return
+
+    if not isinstance(envs_data, AccountRegionScopedDict):
+        # Pre-regional snapshots used unqualified named volumes. Persist those
+        # names on the migrated environment so this and later regional boots
+        # continue mounting the existing Airflow metadata and DAG contents.
+        legacy_items = (
+            envs_data._data.items()
+            if hasattr(envs_data, "_data")
+            else envs_data.items()
+        )
+        for key, env in legacy_items:
+            env_name = key[-1] if isinstance(key, tuple) else key
+            env.setdefault(
+                "_docker_dags_volume_name",
+                f"ministack-mwaa-{env_name}-dags",
+            )
+            env.setdefault(
+                "_docker_db_volume_name",
+                f"ministack-mwaa-{env_name}-db",
+            )
+
     _environments.update(envs_data)
 
     # Re-spin containers for persisted environments
@@ -318,13 +339,17 @@ def _start_airflow_container_in_scope(account_id, region, env_name, env):
 
     try:
         container_name = f"ministack-mwaa-{region}-{env_name}"
+        legacy_container_name = f"ministack-mwaa-{env_name}"
 
-        # Remove stale container from previous runs (same pattern as RDS)
-        try:
-            existing = docker_client.containers.get(container_name)
-            existing.remove(force=True)
-        except Exception:
-            pass
+        # Remove stale current and pre-regional containers before binding the
+        # environment's host port. A container left by the previous naming
+        # scheme can otherwise survive an upgrade and block the regional one.
+        for stale_name in (container_name, legacy_container_name):
+            try:
+                existing = docker_client.containers.get(stale_name)
+                existing.remove(force=True)
+            except Exception:
+                pass
 
         container_kwargs = dict(
             image=image,
@@ -340,9 +365,17 @@ def _start_airflow_container_in_scope(account_id, region, env_name, env):
             container_kwargs["network"] = ms_network
 
         if MWAA_PERSIST:
+            dags_volume_name = env.setdefault(
+                "_docker_dags_volume_name",
+                f"{container_name}-dags",
+            )
+            db_volume_name = env.setdefault(
+                "_docker_db_volume_name",
+                f"{container_name}-db",
+            )
             container_kwargs["volumes"] = {
-                f"ministack-mwaa-{region}-{env_name}-dags": {"bind": "/opt/airflow/dags", "mode": "rw"},
-                f"ministack-mwaa-{region}-{env_name}-db": {"bind": "/opt/airflow", "mode": "rw"},
+                dags_volume_name: {"bind": "/opt/airflow/dags", "mode": "rw"},
+                db_volume_name: {"bind": "/opt/airflow", "mode": "rw"},
             }
 
         container = docker_client.containers.run(**container_kwargs)

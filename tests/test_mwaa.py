@@ -238,7 +238,11 @@ def test_same_name_environments_are_isolated_by_region():
                 pass
 
 
-def test_airflow_runtime_identity_and_background_scope_include_region(monkeypatch):
+@pytest.mark.parametrize("legacy_volumes", [False, True])
+def test_airflow_runtime_identity_and_background_scope_include_region(
+    monkeypatch,
+    legacy_volumes,
+):
     from ministack.core.responses import (
         get_account_id,
         get_region,
@@ -251,13 +255,23 @@ def test_airflow_runtime_identity_and_background_scope_include_region(monkeypatc
         id = "container-id"
         attrs = {}
 
-    class FakeContainers:
         def __init__(self):
+            self.remove_calls = []
+
+        def remove(self, **kwargs):
+            self.remove_calls.append(kwargs)
+
+    class FakeContainers:
+        def __init__(self, legacy_name, legacy_container):
             self.get_calls = []
             self.run_kwargs = None
+            self.legacy_name = legacy_name
+            self.legacy_container = legacy_container
 
         def get(self, name):
             self.get_calls.append(name)
+            if name == self.legacy_name:
+                return self.legacy_container
             raise RuntimeError("not found")
 
         def run(self, **kwargs):
@@ -265,8 +279,8 @@ def test_airflow_runtime_identity_and_background_scope_include_region(monkeypatc
             return FakeContainer()
 
     class FakeDocker:
-        def __init__(self):
-            self.containers = FakeContainers()
+        def __init__(self, legacy_name, legacy_container):
+            self.containers = FakeContainers(legacy_name, legacy_container)
 
     original_account = get_account_id()
     original_region = get_region()
@@ -274,12 +288,17 @@ def test_airflow_runtime_identity_and_background_scope_include_region(monkeypatc
     region = "us-west-2"
     env_name = "regional-runtime"
     expected_name = f"ministack-mwaa-{region}-{env_name}"
+    legacy_name = f"ministack-mwaa-{env_name}"
     env = {
         "AirflowVersion": "3.0.6",
         "AirflowConfigurationOptions": {},
         "Status": "CREATING",
     }
-    docker_client = FakeDocker()
+    if legacy_volumes:
+        env["_docker_dags_volume_name"] = f"{legacy_name}-dags"
+        env["_docker_db_volume_name"] = f"{legacy_name}-db"
+    legacy_container = FakeContainer()
+    docker_client = FakeDocker(legacy_name, legacy_container)
     dag_sync_scope = {}
     dag_sync_complete = threading.Event()
 
@@ -299,16 +318,18 @@ def test_airflow_runtime_identity_and_background_scope_include_region(monkeypatc
         mod._start_airflow_container(account_id, region, env_name, env)
 
         assert dag_sync_complete.wait(timeout=2)
-        assert docker_client.containers.get_calls == [expected_name]
+        assert docker_client.containers.get_calls == [expected_name, legacy_name]
+        assert legacy_container.remove_calls == [{"force": True}]
         assert docker_client.containers.run_kwargs["name"] == expected_name
         assert docker_client.containers.run_kwargs["labels"] == {
             "ministack": "mwaa",
             "region": region,
             "env_name": env_name,
         }
+        expected_volume_prefix = legacy_name if legacy_volumes else expected_name
         assert set(docker_client.containers.run_kwargs["volumes"]) == {
-            f"{expected_name}-dags",
-            f"{expected_name}-db",
+            f"{expected_volume_prefix}-dags",
+            f"{expected_volume_prefix}-db",
         }
         assert dag_sync_scope["value"] == (account_id, region)
         assert (get_account_id(), get_region()) == ("222222222222", "us-east-1")
