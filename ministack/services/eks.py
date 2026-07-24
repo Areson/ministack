@@ -165,11 +165,12 @@ def _restore_access_policy_store(restored, access_entry_regions):
     place them in the ambient boot region, potentially separating them from a
     foreign-region access entry restored from its ``accessEntryArn``.
     """
-    if not restored:
+    if isinstance(restored, AccountRegionScopedDict):
+        if restored.has_any():
+            _access_policies.update(restored)
         return
 
-    if isinstance(restored, AccountRegionScopedDict):
-        _access_policies.update(restored)
+    if not restored:
         return
 
     if isinstance(restored, AccountScopedDict):

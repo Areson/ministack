@@ -500,6 +500,74 @@ def test_eks_round_trip():
     _round_trip("eks", "eks", populate, observe)
 
 
+def test_eks_access_policies_round_trip_outside_boot_region():
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "000000000000"
+    boot_region = "us-east-1"
+    resource_region = "us-west-2"
+    cluster_name = "regional-cluster"
+    principal_arn = f"arn:aws:iam::{account_id}:role/regional-role"
+    entry_key = f"{cluster_name}\x00{principal_arn}"
+    policy_arn = (
+        "arn:aws:eks::aws:cluster-access-policy/AmazonEKSViewPolicy"
+    )
+    policy_key = f"{entry_key}\x00{policy_arn}"
+    mod = _module("eks")
+
+    def populate(mod):
+        mod._access_entries.set_scoped(
+            account_id,
+            resource_region,
+            entry_key,
+            {
+                "clusterName": cluster_name,
+                "principalArn": principal_arn,
+                "accessEntryArn": (
+                    f"arn:aws:eks:{resource_region}:{account_id}:"
+                    f"access-entry/{cluster_name}/role/{account_id}/"
+                    "regional-role/id"
+                ),
+            },
+        )
+        mod._access_policies.set_scoped(
+            account_id,
+            resource_region,
+            policy_key,
+            {
+                "policyArn": policy_arn,
+                "accessScope": {"type": "cluster", "namespaces": []},
+            },
+        )
+        # Restore below runs in the boot scope, where this west-only store is
+        # false even though it contains persisted data in another region.
+        set_request_region(boot_region)
+
+    def observe(mod):
+        assert mod._access_policies.contains_scoped(
+            account_id, resource_region, policy_key
+        )
+        assert not mod._access_policies.contains_scoped(
+            account_id, boot_region, policy_key
+        )
+
+    try:
+        set_request_account_id(account_id)
+        set_request_region(resource_region)
+        _round_trip("eks", "eks", populate, observe)
+    finally:
+        mod.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
 def test_eks_legacy_state_uses_arn_and_parent_regions():
     from ministack.core.responses import (
         AccountScopedDict,
