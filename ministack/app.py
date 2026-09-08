@@ -74,8 +74,8 @@ def _ws_resolve_iot_account_id(scope: dict, ws_headers: dict) -> str:
     Resolution order:
 
     1. ``X-Amz-Credential`` query parameter (SigV4-signed WS) — extract the
-       access key portion. If it's a 12-digit number, use it as the account.
-    2. ``Authorization: AWS4-HMAC-SHA256`` header — same extraction.
+       access key portion and resolve its IAM, STS, or numeric account.
+    2. ``Authorization: AWS4-HMAC-SHA256`` header — same resolution.
     3. Fall back to ``MINISTACK_ACCOUNT_ID`` / ``000000000000``.
 
     SigV4 signature *verification* is intentionally lax (any
@@ -96,8 +96,9 @@ def _ws_resolve_iot_account_id(scope: dict, ws_headers: dict) -> str:
             cred = m.group(1)
 
     access_key = cred.split("/", 1)[0] if cred else ""
-    if access_key and re.match(r"^\d{12}$", access_key):
-        return access_key
+    if access_key:
+        set_request_account_id(_request_account_scope(access_key))
+        return get_account_id()
     return os.environ.get("MINISTACK_ACCOUNT_ID", "000000000000")
 
 
@@ -197,10 +198,19 @@ _NON_S3_VHOST_NAMES = frozenset(
 )
 
 from ministack.core import container_reaper
+from ministack.core.aws_credentials import (
+    AmbiguousAccessKeyError,
+    find_iam_access_key_account,
+)
 from ministack.core.concurrency import spawn_background
 from ministack.core.hypercorn_compat import install as _install_hypercorn_compat
 from ministack.core.persistence import PERSIST_STATE, load_state, save_all
-from ministack.core.responses import _12_DIGIT_RE, set_request_account_id, set_request_region
+from ministack.core.responses import (
+    _12_DIGIT_RE,
+    get_account_id,
+    set_request_account_id,
+    set_request_region,
+)
 from ministack.core.router import detect_service, extract_access_key_id, extract_region
 
 # Must run before hypercorn emits its first Expect: 100-continue reply.
@@ -212,6 +222,11 @@ _install_hypercorn_compat()
 # This saves ~20 MB of idle RAM and speeds up boot.
 # ---------------------------------------------------------------------------
 _loaded_modules: dict = {}
+
+
+def _request_account_scope(access_key_id: str) -> str:
+    """Return the tenant selector for an AWS access key."""
+    return find_iam_access_key_account(access_key_id) or access_key_id
 
 # Execution state of ready.d scripts — surfaced via /_ministack/health and /_ministack/ready.
 # status: "pending" (not started) | "running" | "completed" (all scripts finished, errors included)
@@ -2255,7 +2270,13 @@ async def app(scope, receive, send):
         )
         _ws_key = extract_access_key_id(ws_headers, ws_query)
         if _ws_key:
-            set_request_account_id(_ws_key)
+            try:
+                set_request_account_id(_request_account_scope(_ws_key))
+            except AmbiguousAccessKeyError:
+                msg = await receive()
+                if msg.get("type") == "websocket.connect":
+                    await send({"type": "websocket.close", "code": 1008})
+                return
         ws_region = extract_region(ws_headers, ws_query)
         set_request_region(ws_region)
         ws_host = ws_headers.get("host", "")
@@ -2333,7 +2354,25 @@ async def app(scope, receive, send):
     # If the access key is a 12-digit number, it becomes the account ID.
     _access_key = extract_access_key_id(headers, query_params)
     if _access_key:
-        set_request_account_id(_access_key)
+        try:
+            set_request_account_id(_request_account_scope(_access_key))
+        except AmbiguousAccessKeyError:
+            await _send_response(
+                send,
+                403,
+                {
+                    "Content-Type": "application/json",
+                    "x-amzn-requestid": request_id,
+                    "x-amz-request-id": request_id,
+                },
+                json.dumps(
+                    {
+                        "__type": "InvalidClientTokenId",
+                        "message": "The security token included in the request is invalid.",
+                    }
+                ).encode(),
+            )
+            return
 
     # Set per-request region from SigV4 Credential scope so CFN's AWS::Region
     # pseudo-param and ARN-building use the caller's region, not MINISTACK_REGION
