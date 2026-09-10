@@ -79,11 +79,14 @@ def test_iotwireless_position_estimate_is_geojson_point_blob(iotwireless):
 
 
 def test_iotwireless_accuracy_properties_carry_the_measured_values(iotwireless):
-    """The two accuracy properties carry the values of the one live call
-    (eu-west-1, 2026-08-26), which sent no `AdvancedConfiguration`."""
+    """`horizontalAccuracy` is the value of the one live call (eu-west-1,
+    2026-08-26). `horizontalConfidenceLevel` is the documented default: the
+    developer guide gives 0.68 both as the confidence level's default ("The
+    default value is 0.68, which indicates a 68% probability...") and as what
+    `ConfidencePercent` takes when the caller sends none."""
     properties = json.loads(_estimate_bytes(iotwireless, "1.2.3.4"))["properties"]
     assert properties["horizontalAccuracy"] == 1000000
-    assert properties["horizontalConfidenceLevel"] == 0.67
+    assert properties["horizontalConfidenceLevel"] == 0.68
 
 
 @pytest.mark.parametrize("percent,level", [(50, 0.5), (68, 0.68), (99, 0.99)])
@@ -251,12 +254,14 @@ def test_iotwireless_timestamp_only_input_is_validation_exception(iotwireless):
 
 
 def test_iotwireless_non_ip_hints_alone_are_resource_not_found(iotwireless):
-    """Documented divergence: MiniStack resolves from Ip only, so an input
-    carrying nothing but WLAN measurements is refused with a message naming
-    the IP-only scope (the real service would run the third-party solver).
-    The input is well formed, and AWS documents 404 for a measurement it
-    cannot solve and 400 for measurement data formatted incorrectly, so the
-    scope limit refuses like the address the resolver cannot place."""
+    """Documented divergence: only the Ip resolver exists here, so an input
+    carrying nothing but WLAN measurements cannot be solved (the real service
+    would run the third-party solver). The input is well formed, so it takes
+    the unresolvable-measurement 404 rather than a 400.
+
+    Only the status and the error code are asserted. No message string is
+    documented for this operation, so pinning one here would pin this
+    emulator's own wording and read as if it were AWS's."""
     with pytest.raises(ClientError) as excinfo:
         iotwireless.get_position_estimate(
             WiFiAccessPoints=[{"MacAddress": "A0:EC:F9:1E:32:C1", "Rss": -75}]
@@ -264,7 +269,6 @@ def test_iotwireless_non_ip_hints_alone_are_resource_not_found(iotwireless):
     response = excinfo.value.response
     assert response["ResponseMetadata"]["HTTPStatusCode"] == 404
     assert response["Error"]["Code"] == "ResourceNotFoundException"
-    assert "Ip only" in response["Error"]["Message"]
 
 
 # ---------------------------------------------------------------------------
@@ -328,7 +332,10 @@ def test_iotwireless_raw_timestamp_that_is_not_a_timestamp_is_refused(value):
     assert status == 400
     document = json.loads(raw)
     assert document["__type"] == "ValidationException"
-    assert document["message"] == (
+    # Capital `Message`: the iotwireless/2020-11-22 exception shapes declare
+    # that member with no `locationName`, so that is the wire name. boto3
+    # finds it either way, which is why only these raw-body tests see it.
+    assert document["Message"] == (
         "Timestamp must be a Unix timestamp, in seconds since the epoch"
     )
 
@@ -357,7 +364,7 @@ def test_iotwireless_raw_advanced_configuration_must_be_the_shape(advanced):
     assert status == 400
     document = json.loads(raw)
     assert document["__type"] == "ValidationException"
-    assert "ConfidencePercent" in document["message"]
+    assert "ConfidencePercent" in document["Message"]
 
 
 @pytest.mark.parametrize("ip_member", [{}, {"IpAddress": ""}])
@@ -372,7 +379,7 @@ def test_iotwireless_raw_ip_without_an_address_is_not_valid(ip_member):
     assert status == 400
     document = json.loads(raw)
     assert document["__type"] == "ValidationException"
-    assert document["message"] == (
+    assert document["Message"] == (
         "1 validation error detected: IP Address is not valid."
     )
 
