@@ -8068,3 +8068,63 @@ def test_sfn_jsonata_tomillis_still_parses_iso(sfn):
         assert json.loads(desc["output"]) == {"v": 1577836800000}
     finally:
         sfn.delete_state_machine(stateMachineArn=sm)
+
+
+def test_sfn_choice_numeric_path_dynamic_batch_loop(sfn):
+    """A dynamic batch loop guarded by NumericGreaterThanEqualsPath must exit once
+    the cursor reaches the batch size. Before the *Path relational operators were
+    implemented the guard silently evaluated false, the cursor ran past the end of
+    the array and States.ArrayGetItem raised IndexError, failing the execution."""
+    import uuid as _uuid
+    definition = json.dumps(
+        {
+            "StartAt": "CheckIndex",
+            "States": {
+                "CheckIndex": {
+                    "Type": "Choice",
+                    "Choices": [
+                        {
+                            "Variable": "$.index",
+                            "NumericGreaterThanEqualsPath": "$.count",
+                            "Next": "Done",
+                        }
+                    ],
+                    "Default": "Fetch",
+                },
+                "Fetch": {
+                    "Type": "Pass",
+                    "Parameters": {
+                        "items.$": "$.items",
+                        "count.$": "$.count",
+                        "index.$": "States.MathAdd($.index, 1)",
+                        "item.$": "States.ArrayGetItem($.items, $.index)",
+                    },
+                    "Next": "CheckIndex",
+                },
+                "Done": {
+                    "Type": "Pass",
+                    "Parameters": {"last.$": "$.item", "index.$": "$.index"},
+                    "End": True,
+                },
+            },
+        }
+    )
+    name = f"qa-sfn-numeric-path-loop-{_uuid.uuid4().hex[:8]}"
+    arn = sfn.create_state_machine(
+        name=name,
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/r",
+    )["stateMachineArn"]
+    try:
+        items = ["alpha", "beta", "gamma"]
+        exec_arn = sfn.start_execution(
+            stateMachineArn=arn,
+            input=json.dumps({"items": items, "count": len(items), "index": 0}),
+        )["executionArn"]
+        desc = _wait_sfn(sfn, exec_arn)
+        assert desc["status"] == "SUCCEEDED", desc
+        output = json.loads(desc["output"])
+        assert output["last"] == "gamma"
+        assert output["index"] == 3
+    finally:
+        sfn.delete_state_machine(stateMachineArn=arn)
