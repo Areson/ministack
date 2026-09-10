@@ -118,6 +118,15 @@ def test_ec2_availability_zones_carry_group_and_opt_in(ec2):
     assert all(z["OptInStatus"] == "opt-in-not-required" for z in zones)
 
 
+def test_ec2_availability_zones_carry_zone_type(ec2):
+    """ZoneType is another optional member: a consumer that branches on it (the AWS
+    Load Balancer Controller's subnet locale resolution) gets an empty string, not
+    an error, when it's missing — and fails its own validation on that empty value.
+    Every zone ministack fabricates is a standard Availability Zone."""
+    zones = ec2.describe_availability_zones()["AvailabilityZones"]
+    assert all(z["ZoneType"] == "availability-zone" for z in zones)
+
+
 def test_ec2_describe_regions_returns_commercial_regions(ec2):
     """DescribeRegions must list at least the four legacy us-* regions
     with opt-in-not-required, and emit the shape AWS returns."""
@@ -2670,6 +2679,62 @@ def test_ec2_default_subnets_three_azs(ec2):
     for s in subnets:
         assert s["DefaultForAz"] is True
         assert s["MapPublicIpOnLaunch"] is True
+
+
+def test_ec2_default_subnets_carry_availability_zone_id(ec2):
+    """Default VPC subnets must expose the same ZoneId DescribeAvailabilityZones reports."""
+    resp = ec2.describe_subnets(Filters=[{"Name": "vpc-id", "Values": ["vpc-00000001"]}])
+    by_az = {s["AvailabilityZone"]: s for s in resp["Subnets"]}
+    assert by_az["us-east-1a"]["AvailabilityZoneId"] == "use1-az1"
+    assert by_az["us-east-1b"]["AvailabilityZoneId"] == "use1-az2"
+    assert by_az["us-east-1c"]["AvailabilityZoneId"] == "use1-az3"
+
+
+def test_ec2_create_subnet_availability_zone_id(ec2):
+    """AvailabilityZoneId must never be null: it's derived from the AZ, or honored when given."""
+    vpc_id = ec2.create_vpc(CidrBlock="10.78.0.0/16")["Vpc"]["VpcId"]
+
+    derived = ec2.create_subnet(VpcId=vpc_id, CidrBlock="10.78.1.0/24",
+                                 AvailabilityZone="us-east-1c")["Subnet"]
+    assert derived["AvailabilityZoneId"] == "use1-az3"
+
+    desc = ec2.describe_subnets(SubnetIds=[derived["SubnetId"]])["Subnets"][0]
+    assert desc["AvailabilityZoneId"] == "use1-az3"
+
+    # AZ says use1-az1, but an explicit AvailabilityZoneId must win.
+    explicit = ec2.create_subnet(VpcId=vpc_id, CidrBlock="10.78.2.0/24",
+                                  AvailabilityZone="us-east-1a",
+                                  AvailabilityZoneId="use1-az2")["Subnet"]
+    assert explicit["AvailabilityZoneId"] == "use1-az2"
+
+    ec2.delete_subnet(SubnetId=derived["SubnetId"])
+    ec2.delete_subnet(SubnetId=explicit["SubnetId"])
+    ec2.delete_vpc(VpcId=vpc_id)
+
+
+def test_ec2_backfill_availability_zone_id_on_restore():
+    """A subnet persisted before AvailabilityZoneId existed must not KeyError on restore.
+
+    In-process against ministack.services.ec2 directly (like the AMI/instance tests
+    below): this exercises the module's own state, not whatever separate process is
+    serving the `ec2` fixture's HTTP requests.
+    """
+    import ministack.services.ec2 as ec2mod
+
+    legacy_subnet = {
+        "SubnetId": "subnet-legacy1", "VpcId": "vpc-legacy1", "CidrBlock": "10.9.0.0/24",
+        "AvailabilityZone": "us-east-1b", "AvailableIpAddressCount": 251,
+        "State": "available", "DefaultForAz": False, "MapPublicIpOnLaunch": False,
+        "OwnerId": "000000000000",
+    }
+    ec2mod._subnets["subnet-legacy1"] = legacy_subnet
+    try:
+        ec2mod._backfill_subnet_availability_zone_ids()
+
+        assert legacy_subnet["AvailabilityZoneId"] == "use1-az2"
+        assert "<availabilityZoneId>use1-az2</availabilityZoneId>" in ec2mod._subnet_fields_xml(legacy_subnet)
+    finally:
+        del ec2mod._subnets["subnet-legacy1"]
 
 
 def test_ec2_describe_subnets_tags_filters(ec2):

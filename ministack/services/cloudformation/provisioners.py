@@ -5778,6 +5778,7 @@ def _ec2_subnet_create(logical_id, props, stack_name):
         "VpcId": vpc_id,
         "CidrBlock": cidr,
         "AvailabilityZone": az,
+        "AvailabilityZoneId": _ec2._az_id_for_zone_name(az),
         "State": "available",
         "AvailableIpAddressCount": 251,
         "DefaultForAz": False,
