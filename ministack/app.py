@@ -386,10 +386,12 @@ SERVICE_REGISTRY = {
     "iot": {"module": "iot"},
     "iot-data": {"module": "iot_data"},
     "iot-jobs-data": {"module": "iot_jobs_data"},
+    "iotwireless": {"module": "iotwireless"},
     "kinesis": {"module": "kinesis"},
     "kms": {"module": "kms"},
     "lambda": {"module": "lambda_svc"},
     "lambda-microvms": {"module": "lambda_microvms"},
+    "location": {"module": "location"},
     "logs": {"module": "cloudwatch_logs", "aliases": ("cloudwatch-logs",)},
     "mediaconnect": {"module": "mediaconnect"},
     "opensearch": {"module": "opensearch", "aliases": ("es", "elasticsearch")},
@@ -406,6 +408,7 @@ SERVICE_REGISTRY = {
     "secretsmanager": {"module": "secretsmanager"},
     "servicediscovery": {"module": "servicediscovery"},
     "ses": {"module": "ses"},
+    "signer": {"module": "signer"},
     "sns": {"module": "sns"},
     "sqs": {"module": "sqs"},
     "ssm": {"module": "ssm"},
@@ -413,6 +416,7 @@ SERVICE_REGISTRY = {
     "sts": {"module": "sts"},
     "tagging": {"module": "tagging"},
     "transcribe": {"module": "transcribe"},
+    "translate": {"module": "translate"},
     "transfer": {"module": "transfer"},
     "waf": {"module": "waf_v1"},
     "waf-regional": {"module": "waf_v1"},
@@ -497,8 +501,10 @@ _state_map = {
     "iot": "iot",
     "inspector2": "inspector2",
     "dsql": "dsql",
+    "location": "location",
     "mediaconnect": "mediaconnect",
     "mq": "mq",
+    "signer": "signer",
     "opensearch": "opensearch",
     "s3tables": "s3tables",
     "lambda_durable": "lambda_durable",
@@ -509,6 +515,7 @@ _state_map = {
     "bedrock_agentcore": "bedrock_agentcore",
     "msk": "msk",
     "transcribe": "transcribe",
+    "translate": "translate",
 }
 
 SERVICE_NAME_ALIASES = {
@@ -1237,6 +1244,7 @@ async def _handle_admin_config_request(path: str, method: str, body: bytes):
         "athena.ATHENA_DATA_DIR",
         "stepfunctions._sfn_mock_config",
         "stepfunctions._SFN_WAIT_SCALE",
+        "translate._JOB_RUN_SECONDS",
         "lambda_svc.LAMBDA_EXECUTOR",
         "cloudtrail._recording_enabled",
         "alb.TARGET_CONNECT_TIMEOUT",
@@ -1258,14 +1266,14 @@ async def _handle_admin_config_request(path: str, method: str, body: bytes):
         mod_name, var_name = key.rsplit(".", 1)
         try:
             mod = __import__(f"ministack.services.{mod_name}", fromlist=[var_name])
-            if key == "stepfunctions._SFN_WAIT_SCALE":
+            if key in ("stepfunctions._SFN_WAIT_SCALE", "translate._JOB_RUN_SECONDS"):
                 try:
                     float_value = float(value)
                 except (ValueError, TypeError):
-                    logger.warning("/_ministack/config: invalid SFN_WAIT_SCALE=%r", value)
+                    logger.warning("/_ministack/config: invalid %s=%r", var_name, value)
                     continue
                 if not math.isfinite(float_value) or float_value < 0:
-                    logger.warning("/_ministack/config: invalid SFN_WAIT_SCALE=%r", value)
+                    logger.warning("/_ministack/config: invalid %s=%r", var_name, value)
                     continue
                 value = float_value
             elif key == "cloudtrail._recording_enabled":
