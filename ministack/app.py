@@ -390,6 +390,7 @@ SERVICE_REGISTRY = {
     "kinesis": {"module": "kinesis"},
     "kms": {"module": "kms"},
     "lambda": {"module": "lambda_svc"},
+    "lambda-core": {"module": "lambda_core"},
     "lambda-microvms": {"module": "lambda_microvms"},
     "location": {"module": "location"},
     "logs": {"module": "cloudwatch_logs", "aliases": ("cloudwatch-logs",)},
@@ -465,6 +466,7 @@ _state_map = {
     "cloudwatch": "cloudwatch",
     "s3": "s3",
     "lambda": "lambda_svc",
+    "lambda_core": "lambda_core",
     "lambda_microvms": "lambda_microvms",
     "rds": "rds",
     "ecs": "ecs",
@@ -1245,6 +1247,8 @@ async def _handle_admin_config_request(path: str, method: str, body: bytes):
         "stepfunctions._sfn_mock_config",
         "stepfunctions._SFN_WAIT_SCALE",
         "translate._JOB_RUN_SECONDS",
+        "transcribe._JOB_RUN_SECONDS",
+        "transcribe._JOB_QUEUE_SECONDS",
         "lambda_svc.LAMBDA_EXECUTOR",
         "cloudtrail._recording_enabled",
         "alb.TARGET_CONNECT_TIMEOUT",
@@ -1266,7 +1270,12 @@ async def _handle_admin_config_request(path: str, method: str, body: bytes):
         mod_name, var_name = key.rsplit(".", 1)
         try:
             mod = __import__(f"ministack.services.{mod_name}", fromlist=[var_name])
-            if key in ("stepfunctions._SFN_WAIT_SCALE", "translate._JOB_RUN_SECONDS"):
+            if key in (
+                "stepfunctions._SFN_WAIT_SCALE",
+                "translate._JOB_RUN_SECONDS",
+                "transcribe._JOB_RUN_SECONDS",
+                "transcribe._JOB_QUEUE_SECONDS",
+            ):
                 try:
                     float_value = float(value)
                 except (ValueError, TypeError):
@@ -2177,6 +2186,7 @@ async def _dispatch_service_request(
     if AUTH:
         from ministack.core.iam_actions import (
             access_denied_response,
+            dynamodb_resource_arns,
             extract_iam_action,
             extract_resource_arn,
         )
@@ -2189,7 +2199,31 @@ async def _dispatch_service_request(
             resource_arn = extract_resource_arn(
                 service, method, path, headers, body, routing_params, region, get_account_id()
             )
-            denied = enforce(access_key, iam_action, service, region, resource_arn=resource_arn)
+            service_context = None
+            if service == "dynamodb":
+                try:
+                    dynamodb_body = json.loads(body or b"{}")
+                except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
+                    dynamodb_body = {}
+                projection = dynamodb_body.get("ProjectionExpression")
+                names = dynamodb_body.get("ExpressionAttributeNames") or {}
+                if projection:
+                    attributes = [
+                        names.get(part.strip(), part.strip())
+                        for part in projection.split(",")
+                    ]
+                    service_context = {
+                        "dynamodb:Attributes": attributes,
+                        "dynamodb:Select": dynamodb_body.get(
+                            "Select", "SPECIFIC_ATTRIBUTES"
+                        ),
+                    }
+            enforce_kwargs = {"resource_arn": resource_arn}
+            if service_context is not None:
+                enforce_kwargs["service_context"] = service_context
+            denied = enforce(
+                access_key, iam_action, service, region, **enforce_kwargs
+            )
             # A copy also reads its source, a batch delete is one check per
             # key, an attributes call is a pair, a governance bypass its own action.
             if service == "s3" and not denied:
@@ -2199,6 +2233,19 @@ async def _dispatch_service_request(
                     denied = enforce(access_key, extra_action, service, region, resource_arn=extra_arn)
                     if denied:
                         iam_action = extra_action
+                        break
+            if service == "dynamodb" and not denied:
+                resources = dynamodb_resource_arns(body, region, get_account_id())
+                for extra_arn in resources[1:]:
+                    denied = enforce(
+                        access_key,
+                        iam_action,
+                        service,
+                        region,
+                        resource_arn=extra_arn,
+                        service_context=service_context,
+                    )
+                    if denied:
                         break
             if denied:
                 if isinstance(denied, AuthError):
