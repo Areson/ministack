@@ -51,7 +51,9 @@ from defusedxml.ElementTree import fromstring
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.aws_credentials import (
+    AmbiguousAccessKeyError,
     CredentialResolutionError,
+    find_iam_access_key_account,
     resolve_credential,
 )
 from ministack.core.persistence import load_state
@@ -1569,6 +1571,16 @@ def _verify_presigned_sigv4(method, path, headers, query_params):
     session_token = _qp(query_params, "X-Amz-Security-Token", "") or _qp(
         query_params, "x-amz-security-token", ""
     )
+    # S3 presigned requests verify credentials even with AUTH disabled.
+    # Resolve their tenant here, without changing routing for other requests.
+    try:
+        owner = find_iam_access_key_account(_akid)
+    except AmbiguousAccessKeyError:
+        return _error(
+            "InvalidAccessKeyId", "The AWS Access Key Id is ambiguous.", 403, path
+        )
+    if owner:
+        set_request_account_id(owner)
     credential = resolve_credential(_akid, get_account_id(), session_token)
     if isinstance(credential, CredentialResolutionError):
         if credential.code == "ExpiredTokenException":

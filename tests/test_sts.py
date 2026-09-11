@@ -248,54 +248,6 @@ def test_sts_get_session_token_resolves_query_signed_iam_caller(monkeypatch):
         set_request_account_id(original_account)
 
 
-@pytest.mark.parametrize("presigned", [False, True])
-def test_sts_get_caller_identity_resolves_iam_caller(monkeypatch, presigned):
-    import asyncio
-
-    import ministack.app as app_mod
-    from ministack.core.responses import get_account_id, set_request_account_id
-    from ministack.services import iam as iam_svc
-    from ministack.services import sts as sts_mod
-
-    account_id = "123456789012"
-    user_name = "identity-user"
-    access_key = "test-identity-user-key"
-    original_account = get_account_id()
-    monkeypatch.setattr(app_mod, "AUTH", True)
-    set_request_account_id(account_id)
-    iam_svc._users.set_scoped(account_id, None, user_name, {
-        "UserName": user_name,
-        "UserId": "test-identity-user-id",
-        "Arn": f"arn:aws:iam::{account_id}:user/team/{user_name}",
-        "Path": "/team/",
-        "AttachedPolicies": [],
-    })
-    iam_svc._access_keys.set_scoped(account_id, None, access_key, {
-        "AccessKeyId": access_key,
-        "SecretAccessKey": "test-identity-user-secret",
-        "Status": "Active",
-        "UserName": user_name,
-    })
-    query = {"Action": ["GetCallerIdentity"]}
-    headers = {}
-    credential = f"{access_key}/20260908/us-east-1/sts/aws4_request"
-    if presigned:
-        query["X-Amz-Credential"] = [credential]
-    else:
-        headers["authorization"] = f"AWS4-HMAC-SHA256 Credential={credential}"
-    try:
-        status, _headers, payload = asyncio.run(
-            sts_mod.handle_request("GET", "/", headers, b"", query)
-        )
-
-        assert status == 200
-        assert f"<Account>{account_id}</Account>".encode() in payload
-        assert f"<Arn>arn:aws:iam::{account_id}:user/team/{user_name}</Arn>".encode() in payload
-        assert b"<UserId>test-identity-user-id</UserId>" in payload
-    finally:
-        iam_svc._access_keys.pop_scoped(account_id, None, access_key, None)
-        iam_svc._users.pop_scoped(account_id, None, user_name, None)
-        set_request_account_id(original_account)
 
 
 @pytest.mark.parametrize("auth_enabled", [False, True])

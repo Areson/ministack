@@ -56,20 +56,30 @@ def _caller_identity(
     from ministack.app import AUTH
 
     access_key = extract_access_key_id(headers, query_params) or "test"
-    credential = resolve_credential(access_key, get_account_id())
-    if isinstance(credential, CredentialResolutionError):
-        if AUTH or credential.code != "UnrecognizedClientException":
-            return credential
+    if not AUTH:
+        # Session metadata is descriptive in permissive mode; issuing a
+        # session must not introduce credential rejection checks.
+        from ministack.core.iam_evaluator import resolve_caller_identity
+
+        identity = resolve_caller_identity(access_key)
         account_id = get_account_id()
+        arn = identity["userArn"] if identity else f"arn:aws:iam::{account_id}:root"
+        principal_type = (
+            "AssumedRole" if ":assumed-role/" in arn
+            else "User" if ":user/" in arn else "Root"
+        )
         return {
             "accessKey": access_key,
             "accountId": account_id,
-            "userArn": f"arn:aws:iam::{account_id}:root",
-            "userId": account_id,
-            "principalType": "Root",
-            "principalName": "",
-            "isTemporary": False,
+            "userArn": arn,
+            "userId": identity["userId"] if identity else account_id,
+            "principalType": principal_type,
+            "principalName": arn.rsplit("/", 1)[-1] if principal_type == "User" else "",
+            "isTemporary": bool(identity and identity.get("session")),
         }
+    credential = resolve_credential(access_key, get_account_id())
+    if isinstance(credential, CredentialResolutionError):
+        return credential
     return {
         "accessKey": access_key,
         "accountId": credential.account_id,
@@ -141,19 +151,29 @@ async def handle_request(method, path, headers, body, query_params):
     use_json = "amz-json" in content_type
 
     if action == "GetCallerIdentity":
-        caller = _caller_identity(headers, query_params)
-        if isinstance(caller, CredentialResolutionError):
-            return _credential_error_response(caller)
-        caller_account = caller["accountId"]
-        caller_arn = caller["userArn"]
-        caller_user_id = caller["userId"]
+        auth = headers.get("authorization", "")
+        caller_arn = f"arn:aws:iam::{get_account_id()}:root"
+        caller_user_id = get_account_id()
+        if "Credential=" in auth:
+            try:
+                access_key = auth.split("Credential=")[1].split("/")[0]
+                if access_key in _sessions:
+                    session = _sessions[access_key]
+                    if _session_expired(session):
+                        return _error(403, "ExpiredToken",
+                                      "The security token included in the request is expired",
+                                      ns="sts")
+                    caller_arn = session["Arn"]
+                    caller_user_id = session["UserId"]
+            except Exception:
+                pass
         if use_json:
-            return json_response({"Account": caller_account, "Arn": caller_arn, "UserId": caller_user_id})
+            return json_response({"Account": get_account_id(), "Arn": caller_arn, "UserId": caller_user_id})
         return _xml(200, "GetCallerIdentityResponse",
                     f"<GetCallerIdentityResult>"
                     f"<Arn>{caller_arn}</Arn>"
                     f"<UserId>{caller_user_id}</UserId>"
-                    f"<Account>{caller_account}</Account>"
+                    f"<Account>{get_account_id()}</Account>"
                     f"</GetCallerIdentityResult>",
                     ns="sts")
 

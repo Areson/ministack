@@ -694,12 +694,13 @@ def resolve_caller_identity(access_key_id: str) -> dict | None:
     (never modeled) and no policy evaluation, just the same key resolution the
     evaluator uses, shaped for API Gateway's IAM-authorized proxy events.
 
-    Returns None for an unknown, inactive, or expired key. The ``session``
-    value is the raw ``sts._sessions`` record when the key is a temporary
-    session (AssumeRole, GetSessionToken, or Cognito identity-pool
-    credentials), letting callers surface metadata it carries.
+    Returns None for an unknown key. The ``session`` value is the raw
+    ``sts._sessions`` record when the key is a temporary session (AssumeRole or
+    Cognito identity-pool credentials), letting callers surface the cognito*
+    identity fields it carries.
     """
     from ministack.core.responses import get_account_id
+    from ministack.services import iam as iam_svc
     from ministack.services import sts as sts_svc
 
     if not access_key_id:
@@ -718,17 +719,38 @@ def resolve_caller_identity(access_key_id: str) -> dict | None:
         except Exception:
             return None
 
-    credential = resolve_credential(access_key_id, account_id)
-    if isinstance(credential, CredentialResolutionError):
-        return None
-    return {
-        "accessKey": access_key_id,
-        "accountId": credential.account_id,
-        "userArn": credential.principal_arn,
-        "userId": credential.principal_id,
-        "principalOrgId": _principal_org_id(),
-        "session": sts_svc._sessions.get(access_key_id),
-    }
+    if _is_root_key(access_key_id):
+        return {
+            "accessKey": access_key_id,
+            "accountId": account_id,
+            "userArn": f"arn:aws:iam::{account_id}:root",
+            "userId": account_id,
+            "principalOrgId": _principal_org_id(),
+            "session": None,
+        }
+    session = sts_svc._sessions.get(access_key_id)
+    if session is not None:
+        return {
+            "accessKey": access_key_id,
+            "accountId": account_id,
+            "userArn": session.get("Arn", ""),
+            "userId": session.get("UserId", ""),
+            "principalOrgId": _principal_org_id(),
+            "session": session,
+        }
+    key_record = iam_svc._access_keys.get_scoped(account_id, None, access_key_id)
+    if key_record is not None:
+        user_name = key_record.get("UserName", "")
+        user = iam_svc._users.get_scoped(account_id, None, user_name) or {}
+        return {
+            "accessKey": access_key_id,
+            "accountId": account_id,
+            "userArn": user.get("Arn") or f"arn:aws:iam::{account_id}:user/{user_name}",
+            "userId": user.get("UserId", ""),
+            "principalOrgId": _principal_org_id(),
+            "session": None,
+        }
+    return None
 
 
 def enforce(access_key_id: str, iam_action: str, service: str,

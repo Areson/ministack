@@ -74,8 +74,8 @@ def _ws_resolve_iot_account_id(scope: dict, ws_headers: dict) -> str:
     Resolution order:
 
     1. ``X-Amz-Credential`` query parameter (SigV4-signed WS) — extract the
-       access key portion and resolve its IAM, STS, or numeric account.
-    2. ``Authorization: AWS4-HMAC-SHA256`` header — same resolution.
+       access key portion. If it's a 12-digit number, use it as the account.
+    2. ``Authorization: AWS4-HMAC-SHA256`` header — same extraction.
     3. Fall back to ``MINISTACK_ACCOUNT_ID`` / ``000000000000``.
 
     SigV4 signature *verification* is intentionally lax (any
@@ -96,9 +96,8 @@ def _ws_resolve_iot_account_id(scope: dict, ws_headers: dict) -> str:
             cred = m.group(1)
 
     access_key = cred.split("/", 1)[0] if cred else ""
-    if access_key:
-        set_request_account_id(_request_account_scope(access_key))
-        return get_account_id()
+    if access_key and re.match(r"^\d{12}$", access_key):
+        return access_key
     return os.environ.get("MINISTACK_ACCOUNT_ID", "000000000000")
 
 
@@ -207,7 +206,6 @@ from ministack.core.hypercorn_compat import install as _install_hypercorn_compat
 from ministack.core.persistence import PERSIST_STATE, load_state, save_all
 from ministack.core.responses import (
     _12_DIGIT_RE,
-    get_account_id,
     set_request_account_id,
     set_request_region,
 )
@@ -1741,6 +1739,12 @@ def _resolve_mrap_host(host: str):
 
 async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: dict, body: bytes, query_params: dict):
     """Handle virtual-hosted S3 requests before generic routing."""
+    if _MRAP_HOST_RE.match(host.split(":")[0].strip()):
+        # Alias lookup is account-scoped and precedes the S3 handler. Verify
+        # a SigV4 presign first so lookup uses its credential owner's account.
+        error = _get_module("s3")._verify_presigned_sigv4(method, path, headers, query_params)
+        if error:
+            return error
     mrap_bucket = _resolve_mrap_host(host)
     if mrap_bucket:
         # SigV4A (`AWS4-ECDSA-P256-SHA256`) is what S3 requires for an MRAP and
@@ -2325,13 +2329,7 @@ async def app(scope, receive, send):
         )
         _ws_key = extract_access_key_id(ws_headers, ws_query)
         if _ws_key:
-            try:
-                set_request_account_id(_request_account_scope(_ws_key))
-            except AmbiguousAccessKeyError:
-                msg = await receive()
-                if msg.get("type") == "websocket.connect":
-                    await send({"type": "websocket.close", "code": 1008})
-                return
+            set_request_account_id(_ws_key)
         ws_region = extract_region(ws_headers, ws_query)
         set_request_region(ws_region)
         ws_host = ws_headers.get("host", "")
@@ -2410,7 +2408,7 @@ async def app(scope, receive, send):
     _access_key = extract_access_key_id(headers, query_params)
     if _access_key:
         try:
-            set_request_account_id(_request_account_scope(_access_key))
+            set_request_account_id(_request_account_scope(_access_key) if AUTH else _access_key)
         except AmbiguousAccessKeyError:
             await _send_response(
                 send,

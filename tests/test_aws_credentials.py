@@ -148,57 +148,13 @@ def test_find_iam_access_key_account_returns_unique_owner():
         iam_svc._access_keys.pop_scoped(account_id, None, access_key, None)
 
 
-def test_websocket_iam_access_key_routes_to_owner(monkeypatch):
+
+
+def test_ambiguous_iam_access_key_is_rejected_before_http_routing(monkeypatch):
     from ministack import app as app_mod
     from ministack.core.responses import get_account_id, set_request_account_id
 
-    access_key = "test-websocket-owner-key"
-    account_id = "123456789012"
-    original_account = get_account_id()
-    routed_accounts = []
-    sent = []
-
-    class AppSyncModule:
-        async def handle_websocket(self, scope, receive, send, api_id):
-            routed_accounts.append(get_account_id())
-
-    monkeypatch.setattr(app_mod, "_get_module", lambda _name: AppSyncModule())
-    iam_svc._access_keys.set_scoped(account_id, None, access_key, {
-        "AccessKeyId": access_key,
-        "SecretAccessKey": "secret",
-        "Status": "Active",
-        "UserName": "alice",
-    })
-    scope = {
-        "type": "websocket",
-        "path": "/event/realtime",
-        "headers": [(b"host", b"api.appsync-realtime-api.localhost")],
-        "query_string": (
-            f"X-Amz-Credential={access_key}/20260908/us-east-1/appsync/aws4_request"
-        ).encode(),
-    }
-
-    async def receive():
-        return {"type": "websocket.connect"}
-
-    async def send(message):
-        sent.append(message)
-
-    try:
-        asyncio.run(app_mod.app(scope, receive, send))
-
-        assert routed_accounts == [account_id]
-        assert sent == []
-        assert app_mod._ws_resolve_iot_account_id(scope, {}) == account_id
-    finally:
-        iam_svc._access_keys.pop_scoped(account_id, None, access_key, None)
-        set_request_account_id(original_account)
-
-
-def test_ambiguous_iam_access_key_is_rejected_before_http_routing():
-    from ministack import app as app_mod
-    from ministack.core.responses import get_account_id, set_request_account_id
-
+    monkeypatch.setattr(app_mod, "AUTH", True)
     access_key = "test-ambiguous-http-key"
     accounts = ("000000000000", "123456789012")
     original_account = get_account_id()
@@ -238,44 +194,172 @@ def test_ambiguous_iam_access_key_is_rejected_before_http_routing():
         set_request_account_id(original_account)
 
 
-def test_ambiguous_iam_access_key_closes_websocket():
-    from ministack import app as app_mod
-    from ministack.core.responses import get_account_id, set_request_account_id
 
-    access_key = "test-ambiguous-websocket-key"
-    accounts = ("000000000000", "123456789012")
-    original_account = get_account_id()
+
+@pytest.mark.parametrize("auth_enabled", [False, True])
+@pytest.mark.parametrize("ambiguous", [False, True])
+def test_http_iam_routing_respects_auth_mode(monkeypatch, auth_enabled, ambiguous):
+    from ministack import app as app_mod
+    from ministack.core.responses import get_account_id, request_scope
+
+    key = "test-routing-mode-key"
+    owner = "123456789012"
+    accounts = [owner, "234567890123"] if ambiguous else [owner]
+    monkeypatch.setattr(app_mod, "AUTH", auth_enabled)
+    monkeypatch.setenv("MINISTACK_ACCOUNT_ID", "000000000000")
+    routed = []
     sent = []
-    for account_id in accounts:
-        iam_svc._access_keys.set_scoped(account_id, None, access_key, {
-            "AccessKeyId": access_key,
-            "SecretAccessKey": f"secret-{account_id}",
-            "Status": "Active",
-            "UserName": f"user-{account_id}",
-        })
-    scope = {
-        "type": "websocket",
-        "path": "/event/realtime",
-        "headers": [(b"host", b"api.appsync-realtime-api.localhost")],
-        "query_string": (
-            f"X-Amz-Credential={access_key}/20260908/us-east-1/appsync/aws4_request"
-        ).encode(),
-    }
+
+    async def capture(*args):
+        routed.append(get_account_id())
+        return 200, {}, b"ok"
 
     async def receive():
-        return {"type": "websocket.connect"}
+        return {"type": "http.request", "body": b"", "more_body": False}
 
     async def send(message):
         sent.append(message)
 
+    monkeypatch.setattr(app_mod, "_handle_pre_body_request", capture)
+    for account in accounts:
+        iam_svc._access_keys.set_scoped(account, None, key, {"UserName": "alice"})
     try:
-        asyncio.run(app_mod.app(scope, receive, send))
-
-        assert sent == [{"type": "websocket.close", "code": 1008}]
+        with request_scope("000000000000", "us-east-1"):
+            asyncio.run(app_mod.app({
+                "type": "http", "method": "GET", "path": "/",
+                "headers": [(b"host", b"sts.localhost"), (
+                    b"authorization",
+                    f"AWS4-HMAC-SHA256 Credential={key}/20260911/us-east-1/sts/aws4_request".encode(),
+                )],
+                "query_string": b"",
+            }, receive, send))
+        assert sent[0]["status"] == (403 if auth_enabled and ambiguous else 200)
+        assert routed == ([] if auth_enabled and ambiguous else [
+            owner if auth_enabled else "000000000000"
+        ])
     finally:
-        for account_id in accounts:
-            iam_svc._access_keys.pop_scoped(account_id, None, access_key, None)
-        set_request_account_id(original_account)
+        for account in accounts:
+            iam_svc._access_keys.pop_scoped(account, None, key, None)
+
+
+@pytest.mark.parametrize("auth_enabled", [False, True])
+@pytest.mark.parametrize("bad_token", [False, True])
+def test_s3_presign_verifies_in_both_auth_modes(monkeypatch, auth_enabled, bad_token):
+    from urllib.parse import parse_qs, urlsplit
+
+    import boto3
+    from botocore.config import Config
+
+    from ministack import app as app_mod
+    from ministack.core.responses import get_account_id, request_scope
+    from ministack.services import s3 as s3_svc
+
+    key = "test-presign-mode-key"
+    owner = "123456789012"
+    monkeypatch.setattr(app_mod, "AUTH", auth_enabled)
+    iam_svc._access_keys.set_scoped(owner, None, key, {
+        "UserName": "alice", "Status": "Active", "SecretAccessKey": "secret",
+    })
+    client = boto3.client(
+        "s3", endpoint_url="http://localhost:4566", region_name="us-east-1",
+        aws_access_key_id=key, aws_secret_access_key="secret",
+        aws_session_token="unexpected-token" if bad_token else None,
+        config=Config(signature_version="s3v4"),
+    )
+    url = urlsplit(client.generate_presigned_url(
+        "get_object", Params={"Bucket": "test-bucket", "Key": "object"},
+    ))
+    try:
+        with request_scope("000000000000", "us-east-1"):
+            error = s3_svc._verify_presigned_sigv4(
+                "GET", url.path, {"host": url.netloc}, parse_qs(url.query),
+            )
+            assert get_account_id() == owner
+            if bad_token:
+                assert error[0] == 403
+            else:
+                assert error is None
+    finally:
+        iam_svc._access_keys.pop_scoped(owner, None, key, None)
+
+
+@pytest.mark.parametrize("auth_enabled", [False, True])
+@pytest.mark.parametrize("action", ["GetSessionToken", "AssumeRole"])
+@pytest.mark.parametrize("credential_kind", ["unknown", "inactive", "expired"])
+def test_sts_credential_rejections_require_auth(monkeypatch, auth_enabled, action, credential_kind):
+    from ministack import app as app_mod
+    from ministack.core.responses import request_scope
+
+    key = "test-sts-mode-key"
+    account = "000000000000"
+    monkeypatch.setattr(app_mod, "AUTH", auth_enabled)
+    if credential_kind == "inactive":
+        iam_svc._access_keys.set_scoped(account, None, key, {
+            "UserName": "alice", "Status": "Inactive", "SecretAccessKey": "secret",
+        })
+    if credential_kind == "expired":
+        sts_svc._sessions[key] = {
+            "Arn": f"arn:aws:sts::{account}:assumed-role/role/session",
+            "UserId": "role:session", "SecretAccessKey": "secret",
+            "Expiration": time.time() - 60,
+        }
+    previous = set(sts_svc._sessions)
+    try:
+        with request_scope(account, "us-east-1"):
+            status, _, _ = asyncio.run(sts_svc.handle_request(
+                "GET", "/", {
+                    "authorization": f"AWS4-HMAC-SHA256 Credential={key}/20260911/us-east-1/sts/aws4_request",
+                }, b"", {
+                    "Action": [action], "RoleArn": [f"arn:aws:iam::{account}:role/role"],
+                    "RoleSessionName": ["session"],
+                },
+            ))
+        assert status == (403 if auth_enabled else 200)
+    finally:
+        iam_svc._access_keys.pop_scoped(account, None, key, None)
+        for created in set(sts_svc._sessions) - previous:
+            sts_svc._sessions.pop(created, None)
+        sts_svc._sessions.pop(key, None)
+
+
+def test_presigned_mrap_resolves_alias_in_iam_owner_account(monkeypatch):
+    from urllib.parse import parse_qs, urlsplit
+
+    from botocore.auth import S3SigV4QueryAuth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+
+    from ministack import app as app_mod
+    from ministack.core.responses import get_account_id, request_scope
+    from ministack.services import s3 as s3_svc
+
+    key, owner, alias = "test-mrap-owner-key", "123456789012", "testalias.mrap"
+    host = f"{alias}.accesspoint.s3-global.amazonaws.com"
+    monkeypatch.setattr(app_mod, "AUTH", False)
+    request = AWSRequest(method="GET", url=f"http://{host}/object")
+    S3SigV4QueryAuth(Credentials(key, "secret"), "s3", "us-east-1").add_auth(request)
+    url = urlsplit(request.url)
+    routed = []
+
+    async def capture(method, path, headers, body, query_params, **kwargs):
+        routed.append((get_account_id(), path))
+        return 200, {}, b"object"
+
+    monkeypatch.setattr(s3_svc, "handle_request", capture)
+    iam_svc._access_keys.set_scoped(owner, None, key, {
+        "UserName": "alice", "Status": "Active", "SecretAccessKey": "secret",
+    })
+    s3_svc._mraps.set_scoped(owner, None, alias, {"Regions": ["member-bucket"]})
+    try:
+        with request_scope("000000000000", "us-east-1"):
+            result = asyncio.run(app_mod._handle_s3_vhost_request(
+                host, url.path, "GET", {"host": host}, b"", parse_qs(url.query),
+            ))
+        assert result[0] == 200
+        assert routed == [(owner, "/member-bucket/object")]
+    finally:
+        iam_svc._access_keys.pop_scoped(owner, None, key, None)
+        s3_svc._mraps.pop_scoped(owner, None, alias, None)
 
 
 def test_resolve_get_session_token_principal_retains_user_policies():
