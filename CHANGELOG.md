@@ -7,6 +7,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **IAM — three calls are authorized against the action and resource AWS uses** — a Lambda Function URL invoke is checked against its function ARN, alias qualifier included, and supplies `lambda:FunctionUrlAuthType`, so the policy `grantInvokeUrl` writes matches. The WebSocket `@connections` API asks for `execute-api:ManageConnections` instead of `execute-api:Invoke`. `iot-jobs-data` operations are authorized under `iotjobsdata:`, except `StartCommandExecution`, which stays on `iot:`. A policy written for the old action names stops matching, as on AWS. Contributed by @iot-rocket.
 ### Added
 - **CloudFormation: the `AWS::LanguageExtensions` transform**: a template declaring it was provisioned unexpanded, so an `Fn::ForEach` left the stack in `CREATE_IN_PROGRESS` for good and an `Fn::ToJsonString` reached SSM as a Python dict. The transform now runs between `AWS::Include` and SAM: `Fn::ForEach` over literal, `CommaDelimitedList` and intrinsic collections, nested and inside `Properties`, plus `Fn::Length` and `Fn::ToJsonString`. Where the identifier is substituted, the error sentences and the unexpanded `GetTemplateSummary` follow measurements on a real account. Contributed by @iot-rocket.
 ### Fixed
