@@ -664,6 +664,13 @@ _CUSTOM_NAME_REPLACEMENT = {
         "name": "InstanceProfileName",
         "requires_replacement": lambda old, new: old.get("Path", "/") != new.get("Path", "/"),
     },
+    "AWS::IoT::ProvisioningTemplate": {
+        "name": "TemplateName",
+        "requires_replacement": lambda old, new: (
+            old.get("TemplateType", "FLEET_PROVISIONING")
+            != new.get("TemplateType", "FLEET_PROVISIONING")
+        ),
+    },
     # "If you specify a name, you cannot perform updates that require
     # replacement of this resource, but you can perform other updates"
     # (aws-resource-elasticloadbalancingv2-loadbalancer), which is this rule
@@ -1568,7 +1575,7 @@ def _sns_sub_create(logical_id, props, stack_name):
     topic = _sns._topics.get(topic_arn)
     if not topic:
         sub_arn = f"{topic_arn}:{new_uuid()}"
-        return sub_arn, {"SubscriptionArn": sub_arn}
+        return sub_arn, {"Arn": sub_arn}
 
     sub_arn = f"{topic_arn}:{new_uuid()}"
     attributes = {
@@ -1588,7 +1595,7 @@ def _sns_sub_create(logical_id, props, stack_name):
     }
     topic["subscriptions"].append(sub)
     _sns._sub_arn_to_topic[sub_arn] = topic_arn
-    return sub_arn, {"SubscriptionArn": sub_arn}
+    return sub_arn, {"Arn": sub_arn}
 
 
 def _sns_sub_update(physical_id, old_props, new_props, stack_name, logical_id=None):
@@ -1623,7 +1630,7 @@ def _sns_sub_update(physical_id, old_props, new_props, stack_name, logical_id=No
         })
         if resp[0] >= 400:
             raise ValueError(f"AWS::SNS::Subscription update failed: {resp[2]!r}")
-    return physical_id, {"SubscriptionArn": physical_id}
+    return physical_id, {"Arn": physical_id}
 
 
 def _sns_sub_delete(physical_id, props):
@@ -1996,7 +2003,13 @@ def _lambda_update(physical_id, old_props, new_props, stack_name, logical_id=Non
     code = new_props.get("Code", {})
     image_uri = code.get("ImageUri")
     is_image = new_props.get("PackageType") == "Image" or bool(image_uri)
-    if is_image != (func["config"].get("PackageType") == "Image"):
+    # DurableConfig and TenancyConfig are "Update requires: Replacement" in the
+    # resource reference, like a PackageType flip: same local equivalent.
+    replacing = is_image != (func["config"].get("PackageType") == "Image") or any(
+        old_props.get(p) != new_props.get(p)
+        for p in ("DurableConfig", "TenancyConfig")
+    )
+    if replacing:
         # The re-provision replaces the whole function record under the same
         # name — a stale warm worker or pooled container would keep serving
         # the old package. Invalidate both, the way _update_code does.
@@ -3299,7 +3312,9 @@ def _eks_nodegroup_create(logical_id, props, stack_name):
     key = f"{cluster_name}/{ng_name}"
     ng = _eks._nodegroups.get(key, {})
     arn = ng.get("nodegroupArn", "")
-    return ng_name, {"Arn": arn}
+    return ng_name, {"ClusterName": ng.get("clusterName", cluster_name),
+                     "NodegroupName": ng.get("nodegroupName", ng_name),
+                     "Arn": arn}
 
 
 def _eks_nodegroup_delete(physical_id, props):
@@ -3597,15 +3612,16 @@ def _cfn_wait_condition_create(logical_id, props, stack_name):
     data = _wc.wait_for(token, stack_id, stack_name, logical_id,
                         "AWS::CloudFormation::WaitCondition", count, timeout_s)
     pid = f"{stack_name}-{logical_id}-{new_uuid()[:8]}"
-    attrs = {"Data": json.dumps(data), "Id": pid}
-    _wc.remember_result(pid, attrs)
-    return pid, attrs
+    return pid, {"Data": json.dumps(data), "Id": pid}
 
 
 def _cfn_wait_condition_update(physical_id, old_props, new_props, stack_name):
-    """Updates are not supported on AWS; the resource keeps its id and data."""
-    from ministack.services.cloudformation import wait_conditions as _wc
-    return physical_id, _wc.recall_result(physical_id) or {"Data": "{}", "Id": physical_id}
+    """AWS refuses the update outright: UPDATE_FAILED with "Update to resource
+    type AWS::CloudFormation::WaitCondition is not supported", then a rollback
+    (captured eu-north-1 2026-09-19). Succeeding silently hid that."""
+    raise ValueError(
+        "Update to resource type AWS::CloudFormation::WaitCondition is not supported."
+    )
 
 
 def _cfn_wait_condition_handle_create(logical_id, props, stack_name):
@@ -4068,6 +4084,7 @@ def _apigw_rest_api_create(logical_id, props, stack_name):
             root_id = rid
             break
     return api_id, {
+        "RestApiId": api_id,
         "RootResourceId": root_id,
         "Arn": f"arn:aws:apigateway:{get_region()}::/restapis/{api_id}",
     }
@@ -4121,6 +4138,7 @@ def _apigw_rest_api_update(physical_id, old_props, new_props, stack_name, logica
             root_id = rid
             break
     return physical_id, {
+        "RestApiId": physical_id,
         "RootResourceId": root_id,
         "Arn": f"arn:aws:apigateway:{get_region()}::/restapis/{physical_id}",
     }
@@ -4997,6 +5015,20 @@ def _apigw_documentation_version_delete(physical_id, props):
 
 # --- Lambda EventSourceMapping ---
 
+def _lambda_esm_attrs(esm_id: str) -> dict:
+    """``Id`` and ``EventSourceMappingArn`` are the type's documented attributes;
+    ``UUID`` is kept for templates written against earlier releases. The ARN
+    shape is botocore's ``EventSourceMappingArn`` pattern."""
+    return {
+        "Id": esm_id,
+        "EventSourceMappingArn": (
+            f"arn:aws:lambda:{get_region()}:{get_account_id()}:"
+            f"event-source-mapping:{esm_id}"
+        ),
+        "UUID": esm_id,
+    }
+
+
 def _lambda_esm_create(logical_id, props, stack_name):
     func, func_name, resource_arn, qualifier = _lambda_function_for_cfn_ref(props.get("FunctionName", ""))
     esm_id = new_uuid()
@@ -5042,7 +5074,7 @@ def _lambda_esm_create(logical_id, props, stack_name):
     # API CreateEventSourceMapping path; no-op for SQS/Kinesis sources (#936).
     _lambda_svc._init_stream_position(esm_id, esm["EventSourceArn"], esm["StartingPosition"])
     _lambda_svc._ensure_poller()
-    return esm_id, {"UUID": esm_id}
+    return esm_id, _lambda_esm_attrs(esm_id)
 
 
 def _lambda_esm_delete(physical_id, props):
@@ -5087,7 +5119,7 @@ def _lambda_esm_update(physical_id, old_props, new_props, stack_name):
         esm["FunctionName"] = func_name
         esm["FunctionArn"] = func_arn + (f":{qualifier}" if qualifier else "")
     esm["LastModified"] = int(time.time())
-    return physical_id, {"UUID": physical_id}
+    return physical_id, _lambda_esm_attrs(physical_id)
 
 
 # --- Lambda EventInvokeConfig ---
@@ -5328,7 +5360,7 @@ def _policy_attachment_update(physical_id, old_props, new_props, members, store)
         record = store.get(member)
         if record:
             record["attributes"]["Policy"] = policy_doc
-    return physical_id, {}
+    return physical_id, {"Id": physical_id}
 
 
 def _policy_attachment_create(logical_id, props, stack_name, members, store):
@@ -5340,7 +5372,8 @@ def _policy_attachment_create(logical_id, props, stack_name, members, store):
         record = store.get(member)
         if record:
             record["attributes"]["Policy"] = policy_doc
-    return f"{stack_name}-{logical_id}-{new_uuid()[:8]}", {}
+    pid = f"{stack_name}-{logical_id}-{new_uuid()[:8]}"
+    return pid, {"Id": pid}
 
 
 def _policy_attachment_delete(props, members, store):
@@ -5532,7 +5565,8 @@ def _appsync_apikey_create(logical_id, props, stack_name):
         "expires": props.get("Expires", int(time.time()) + 604800),
     }
     _appsync._api_keys.setdefault(api_id, {})[key_id] = key
-    return key_id, {"ApiKey": key_id, "Arn": f"arn:aws:appsync:{get_region()}:{get_account_id()}:apis/{api_id}/apikeys/{key_id}"}
+    return key_id, {"ApiKeyId": key_id, "ApiKey": key_id,
+                    "Arn": f"arn:aws:appsync:{get_region()}:{get_account_id()}:apis/{api_id}/apikeys/{key_id}"}
 
 
 def _appsync_apikey_delete(physical_id, props):
@@ -5594,7 +5628,7 @@ def _sm_secret_create(logical_id, props, stack_name):
     }
     if props.get("ReplicaRegions"):
         _sm_secret_replicate(name, props["ReplicaRegions"])
-    return name, {"Arn": arn}
+    return name, {"Id": arn, "Arn": arn}
 
 
 def _sm_secret_replicate(secret_id, regions):
@@ -5648,7 +5682,7 @@ def _sm_secret_update(physical_id, old_props, new_props, stack_name, logical_id=
         # a region dropped from the template keeps its replica, the service
         # has no RemoveRegionsFromReplication to take it down with.
         _sm_secret_replicate(physical_id, new_props["ReplicaRegions"])
-    return physical_id, {"Arn": secret["ARN"]}
+    return physical_id, {"Id": secret["ARN"], "Arn": secret["ARN"]}
 
 
 def _sm_secret_delete(physical_id, props):
@@ -8805,15 +8839,30 @@ def _ses_configuration_set_event_destination_delete(physical_id, props):
 # WAFv2 WebACL
 # ---------------------------------------------------------------------------
 
+def _waf_web_acl_parts(physical_id, props):
+    """The ``name, id, scope`` a web ACL's physical id carries. A physical id
+    written before the Ref carried all three is the bare id, so its scope has
+    to come from the template."""
+    parts = str(physical_id).split("|")
+    if len(parts) == 3:
+        return parts[0], parts[1], parts[2]
+    return "", str(physical_id), props.get("Scope", "REGIONAL")
+
+
 def _waf_web_acl_create(logical_id, props, stack_name):
     name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=128)
-    scope = props.get("Scope", "REGIONAL")
-    uid, arn, _record = _waf.create_web_acl_record(name, scope, props)
-    return uid, {"Arn": arn, "Id": uid}
+    uid, arn, record = _waf.create_web_acl_record(
+        name, props.get("Scope", "REGIONAL"), props)
+    # Ref is "name|id|scope", not the bare id: "The Ref for the resource,
+    # containing the resource name, physical ID, and scope, formatted as
+    # follows: name|id|scope" (aws-resource-wafv2-webacl). The scope comes
+    # from the record, which normalised it.
+    return f"{name}|{uid}|{record['Scope']}", {"Arn": arn, "Id": uid}
 
 
 def _waf_web_acl_delete(physical_id, props):
-    _waf.delete_web_acl_record(physical_id, props.get("Scope", "REGIONAL"))
+    _name, uid, scope = _waf_web_acl_parts(physical_id, props)
+    _waf.delete_web_acl_record(uid, scope)
 
 
 def _waf_web_acl_update(physical_id, old_props, new_props, stack_name,
@@ -8837,7 +8886,9 @@ def _waf_web_acl_update(physical_id, old_props, new_props, stack_name,
     # asks for: the store is keyed by the scope's home region, so the new
     # scope addresses a different store. _waf_web_acl_delete reads old_props
     # for the same reason.
-    acl = _waf.web_acl_record(physical_id, old_props.get("Scope", "REGIONAL"))
+    # The physical id is "name|id|scope"; the store is keyed by the id alone.
+    _old_name, acl_id, acl_scope = _waf_web_acl_parts(physical_id, old_props)
+    acl = _waf.web_acl_record(acl_id, acl_scope)
     replaced = _rename_replacement(
         physical_id, old_props, new_props, stack_name, logical_id,
         name, acl.get("Name") if acl else None,
@@ -8855,7 +8906,7 @@ def _waf_web_acl_update(physical_id, old_props, new_props, stack_name,
         return created
 
     _waf.update_web_acl_record(acl, new_props)
-    return physical_id, {"Arn": acl["ARN"], "Id": physical_id}
+    return physical_id, {"Arn": acl["ARN"], "Id": acl_id}
 
 
 # ---------------------------------------------------------------------------
@@ -9240,7 +9291,7 @@ def _asg_create(logical_id, props, stack_name):
     asg["Tags"] = tags
     _asg._asgs[name] = asg
     _asg._tags[name] = tags
-    return name, {"Arn": arn}
+    return name, {"AutoScalingGroupARN": arn, "Arn": arn}
 
 
 def _asg_delete(physical_id, props):
@@ -9707,13 +9758,18 @@ def _iot_thing_group_update(physical_id, old_props, new_props, stack_name, logic
     the new group is created before the old one is removed, as CloudFormation
     orders a replacement, and Ref follows the new id. QueryString and Tags are
     accepted without effect — the service has no dynamic groups and no tag
-    store for thing groups."""
+    store for thing groups. An auto-named group takes its deterministic name
+    back on a replacement, so the predecessor comes off first or
+    CreateThingGroup answers ResourceAlreadyExistsException; same shape as the
+    DynamoDB key-schema and Location tracker branches."""
     rec = _iot_thing_group_record(physical_id)
     replacement = rec is None or any(
         new_props.get(key) != old_props.get(key)
         for key in ("ThingGroupName", "ParentGroupName")
     )
     if replacement:
+        if rec is not None and not new_props.get("ThingGroupName"):
+            _iot_thing_group_delete(physical_id, old_props)
         return _iot_thing_group_create(logical_id or physical_id, new_props, stack_name)
     name = rec["thingGroupName"]
     resp = _iot._update_thing_group(
@@ -9859,12 +9915,20 @@ def _iot_provisioning_template_update(physical_id, old_props, new_props, stack_n
     an UpdateProvisioningTemplate member (AWS stores it as a new version via
     CreateProvisioningTemplateVersion, which MiniStack does not model), so a
     changed body is written onto the stored record directly — the template
-    always stays at defaultVersionId 1. TemplateType is create-only on AWS
-    (a change replaces the template); a changed value is ignored here.
+    always stays at defaultVersionId 1. TemplateType requires replacement: under
+    an explicit name _custom_named_replacement_error refuses it as CloudFormation
+    does, and under a generated name the deterministic value is reused, so the
+    predecessor comes off first.
     """
     name = new_props.get("TemplateName") or _physical_name(
         stack_name, logical_id or physical_id, max_len=36
     )
+    if (old_props.get("TemplateType", "FLEET_PROVISIONING")
+            != new_props.get("TemplateType", "FLEET_PROVISIONING")):
+        _iot_provisioning_template_delete(physical_id, old_props)
+        return _iot_provisioning_template_create(
+            logical_id or physical_id, new_props, stack_name
+        )
     if name != physical_id:
         created = _iot_provisioning_template_create(
             logical_id or physical_id, new_props, stack_name
@@ -9980,6 +10044,16 @@ def _iot_ca_certificate_update(physical_id, old_props, new_props, stack_name):
             "AWS::IoT::CACertificate cannot update CACertificatePem in place: "
             "the certificate id is derived from the PEM. Declare a new "
             "CACertificate resource for the new PEM and remove this one."
+        )
+    if new_props.get("VerificationCertificatePem") != old_props.get(
+        "VerificationCertificatePem"
+    ):
+        # Update-requires-replacement in the resource reference, and
+        # UpdateCACertificate carries no verification-certificate member, so
+        # the same refusal as CertificateMode below applies.
+        raise ValueError(
+            "AWS::IoT::CACertificate cannot update VerificationCertificatePem "
+            "in place: declare a new CACertificate resource for it."
         )
     if not new_props.get("Status"):
         raise ValueError("AWS::IoT::CACertificate requires Status")
@@ -10475,7 +10549,7 @@ _RESOURCE_HANDLERS = {
         "delete_with_logical_id": True,
     },
     "AWS::Lambda::Version": {"create": _lambda_version_create, "delete": _lambda_version_delete},
-    "AWS::CloudFormation::WaitCondition": {"create": _cfn_wait_condition_create, "update": _cfn_wait_condition_update, "delete": _cfn_noop_delete},
+    "AWS::CloudFormation::WaitCondition": {"create": _cfn_wait_condition_create, "update": _cfn_wait_condition_update},
     "AWS::CloudFormation::WaitConditionHandle": {"create": _cfn_wait_condition_handle_create, "delete": _cfn_wait_condition_handle_delete},
     "AWS::CloudFormation::Stack": {
         "create": _cfn_nested_stack_create,

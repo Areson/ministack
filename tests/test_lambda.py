@@ -25,6 +25,7 @@ from conftest import (
     LoopProbe,
     concurrent_burst,
     make_probe_lambda,
+    patch_endpoint_dns,
 )
 
 _endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
@@ -1704,8 +1705,11 @@ def test_lambda_warm_start(lam, apigw):
         req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
         return _urlreq.urlopen(req).read().decode()
 
-    t1 = call()  # cold start — spawns worker, imports module
-    t2 = call()  # warm — reuses worker, same module state
+    # The generated execute-api subdomain is not in DNS; only the literal
+    # endpoint host is. patch_endpoint_dns maps *.{host} onto it.
+    with patch_endpoint_dns():
+        t1 = call()  # cold start — spawns worker, imports module
+        t2 = call()  # warm — reuses worker, same module state
     assert t1 == t2, f"Warm worker should reuse module state: {t1} != {t2}"
 
     apigw.delete_api(ApiId=api_id)
@@ -4130,7 +4134,8 @@ def test_apigwv2_nodejs_lambda_proxy(lam, apigw):
             method="GET",
         )
         req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
-        resp = _urlreq.urlopen(req).read().decode()
+        with patch_endpoint_dns():
+            resp = _urlreq.urlopen(req).read().decode()
         body = json.loads(resp)
 
         assert body.get("route") == "GET /test", f"Expected handler result, got: {resp}"
@@ -4782,7 +4787,14 @@ _DENIED = "AccessDeniedException"
     pytest.param("granted-elsewhere", "111111111111", None, _DENIED, _DENIED, id="grant-to-another-account"),
     pytest.param("partly-seeded", "*", _foreign_arn("partly-seeded", 35), _DENIED, _DENIED,
                  id="missing-version-of-known-layer"),
-    pytest.param(None, None, _AWS_MANAGED_LAYER, _DENIED, _DENIED, id="unknown-foreign-layer"),
+    # A name AWS does not publish, under the same account: the gate is the layer
+    # NAME, so this is still denied.
+    pytest.param(None, None, _foreign_arn("not-an-aws-extension", 38), _DENIED, _DENIED,
+                 id="unknown-foreign-layer"),
+    # An extension AWS publishes itself carries a public grant on AWS, so a
+    # template referencing it deploys there. It resolves here too; the bytes are
+    # not available offline, so CodeSize is 0 and the extension does not run.
+    pytest.param(None, None, _AWS_MANAGED_LAYER, None, None, id="aws-published-extension"),
     pytest.param(None, None, _OTHER_REGION_LAYER, _DENIED, _DENIED, id="another-region"),
     pytest.param(None, None, _foreign_arn("nope-not-here", 1, _CALLER_ACCOUNT),
                  "InvalidParameterValueException", "ResourceNotFoundException", id="own-account-layer-missing"),
@@ -4803,7 +4815,8 @@ def test_lambda_cross_account_layer_verdicts(layer_name, granted_to, arn, attach
     if attach_error is None:
         assert version_config["Content"]["CodeSize"] == (_FOREIGN_CODE_SIZE if layer_name else 0)
     if read_error is None:
-        assert (payload["LayerVersionArn"], payload["Content"]["CodeSize"]) == (arn, _FOREIGN_CODE_SIZE)
+        expected_size = _FOREIGN_CODE_SIZE if layer_name else 0
+        assert (payload["LayerVersionArn"], payload["Content"]["CodeSize"]) == (arn, expected_size)
         assert not [key for key in payload if key.startswith("_")]
 
 

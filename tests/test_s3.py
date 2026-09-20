@@ -6666,3 +6666,74 @@ def test_s3_mrap_cleared_by_reset(cfn, s3):
     with pytest.raises(urllib.error.HTTPError) as ei:
         _mrap_get(alias, "who.txt")
     assert ei.value.code in (403, 404)
+
+
+def _s3_lambda_arn(name="s3-notify-target"):
+    return f"arn:aws:lambda:us-east-1:000000000000:function:{name}"
+
+
+def test_s3_notification_is_stored_in_the_sdk_wire_form(s3):
+    """Stored as the wire spells it, so any SDK reads back what another wrote."""
+    import urllib.request
+
+    bucket = f"notif-wire-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bucket)
+    arn = _s3_lambda_arn()
+    xml = (
+        '<NotificationConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+        "<LambdaFunctionConfiguration>"
+        f"<LambdaFunctionArn>{arn}</LambdaFunctionArn>"
+        "<Event>s3:ObjectCreated:*</Event>"
+        "</LambdaFunctionConfiguration></NotificationConfiguration>"
+    )
+    request = urllib.request.Request(
+        f"{ENDPOINT}/{bucket}?notification", data=xml.encode(), method="PUT")
+    with urllib.request.urlopen(request) as response:
+        assert response.status == 200
+
+    configs = s3.get_bucket_notification_configuration(
+        Bucket=bucket)["LambdaFunctionConfigurations"]
+    assert [c["LambdaFunctionArn"] for c in configs] == [arn]
+    assert configs[0]["Events"] == ["s3:ObjectCreated:*"]
+
+
+def test_s3_notification_auto_generates_a_base64_uuid_id(s3, sqs):
+    """An omitted Id is base64 of a UUID (captured us-east-1 2026-09-20)."""
+    import base64 as _b64
+
+    bucket = f"notif-id-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bucket)
+    queue = sqs.create_queue(QueueName=f"notif-id-{_uuid_mod.uuid4().hex[:8]}")["QueueUrl"]
+    queue_arn = sqs.get_queue_attributes(
+        QueueUrl=queue, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    s3.put_bucket_notification_configuration(
+        Bucket=bucket,
+        NotificationConfiguration={"QueueConfigurations": [
+            {"QueueArn": queue_arn, "Events": ["s3:ObjectCreated:*"]}]},
+    )
+    config = s3.get_bucket_notification_configuration(
+        Bucket=bucket)["QueueConfigurations"][0]
+    generated = config["Id"]
+    assert generated, "AWS auto-generates an Id when the caller omits one"
+    # base64 of a 36-char UUID: 48 chars, no padding.
+    assert len(generated) == 48
+    decoded = _b64.b64decode(generated + "==").decode()
+    assert _uuid_mod.UUID(decoded)
+    # It is stable across reads, not minted per GET.
+    assert s3.get_bucket_notification_configuration(
+        Bucket=bucket)["QueueConfigurations"][0]["Id"] == generated
+
+
+def test_s3_notification_keeps_an_explicit_id(s3, sqs):
+    bucket = f"notif-expl-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bucket)
+    queue = sqs.create_queue(QueueName=f"notif-expl-{_uuid_mod.uuid4().hex[:8]}")["QueueUrl"]
+    queue_arn = sqs.get_queue_attributes(
+        QueueUrl=queue, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    s3.put_bucket_notification_configuration(
+        Bucket=bucket,
+        NotificationConfiguration={"QueueConfigurations": [
+            {"Id": "mine", "QueueArn": queue_arn, "Events": ["s3:ObjectCreated:*"]}]},
+    )
+    assert s3.get_bucket_notification_configuration(
+        Bucket=bucket)["QueueConfigurations"][0]["Id"] == "mine"

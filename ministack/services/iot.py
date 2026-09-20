@@ -637,6 +637,16 @@ def _describe_endpoint(qp: dict) -> tuple:
         host = f"{prefix}-ats.iot.{region}.{_MINISTACK_HOST}:{_GATEWAY_PORT}"
     elif endpoint_type == "iot:CredentialProvider":
         host = f"{prefix}.credentials.iot.{region}.{_MINISTACK_HOST}:{_GATEWAY_PORT}"
+    elif endpoint_type == "iot:Jobs":
+        # Retired: AWS now serves Jobs and Commands from the Data-ATS endpoint
+        # (captured eu-north-1 2026-09-19). Signing with the `iot-jobs-data`
+        # scope against the Data-ATS host routes there already.
+        return error_response_json(
+            "InvalidRequestException",
+            "IoT Jobs and Commands APIs are now available through iot:Data-ATS "
+            "endpoints instead of iot:Jobs endpoints. Please use iot:Data-ATS.",
+            400,
+        )
     else:
         return error_response_json(
             "InvalidRequestException",
@@ -2989,9 +2999,8 @@ def _eval_select_function(
             return _MISSING
         return value.replace(old, new)
     if name == "clientid" and not args:
-        # HTTP publishes carry no MQTT client id — AWS resolves clientid() to
-        # Undefined there, so the field is omitted from the projection.
-        return client_id if client_id else _MISSING
+        # Documented as the client id "or n/a if the message wasn't sent over MQTT".
+        return client_id if client_id else "n/a"
     # principal() and traceid() land here too: this publish path carries no
     # certificate identity or trace id to report, so they warn like any other
     # function the evaluator does not implement.
@@ -3058,7 +3067,9 @@ def _eval_select_expr(expr: str, topic: str, payload: bytes, message, client_id:
 # NOT can tell that apart from false. `_eval_where` then fires the rule on true
 # alone, so an Undefined predicate fails closed however it was reached.
 
-_WHERE_OPERATORS = ("<>", "!=", "==", "<=", ">=", "=", "<", ">")
+# AWS refuses `!=` ("Unexpected character '!'") and `==` ("Unexpected token,
+# 'EQ'") — captured eu-north-1 2026-09-19. Longest first so <= beats <.
+_WHERE_OPERATORS = ("<>", "<=", ">=", "=", "<", ">")
 _REGEXP_MATCHES_RE = re.compile(
     r"regexp_matches\s*\(\s*(?P<expr>.+?)\s*,\s*'(?P<regex>[^']*)'\s*\)",
     re.IGNORECASE | re.DOTALL,
@@ -3494,10 +3505,10 @@ def _eval_where_node(node: tuple, topic: str, payload: bytes, message, client_id
     right = _eval_select_expr(right_expr, topic, payload, message, client_id)
     if left is _MISSING or right is _MISSING:
         return _MISSING
-    if op in ("=", "=="):
+    if op == "=":
         # Equality does not convert: on AWS a mismatched pair is simply unequal.
         return _where_values_equal(left, right)
-    if op in ("<>", "!="):
+    if op == "<>":
         return not _where_values_equal(left, right)
     lnum, rnum = _sql_as_number(left), _sql_as_number(right)
     if lnum is None or rnum is None:
@@ -3552,8 +3563,15 @@ def _validate_rule_sql(sql: str) -> str | None:
     ):
         return "FROM clause must name a topic filter in single quotes"
     pred = _rule_where_clause(sql)
-    if pred and _parse_where(pred) is None:
-        return f"Unsupported WHERE clause: {pred}"
+    if pred:
+        # A nested SELECT (the documented EXISTS-subquery form) is refused by
+        # AWS itself: "Unexpected token, 'SELECT'" (captured eu-north-1
+        # 2026-09-19). Literals are blanked first so 'select' inside a string
+        # is not mistaken for the keyword.
+        if re.search(r"\bSELECT\b", _SQL_LITERAL_RE.sub("''", pred), re.IGNORECASE):
+            return f"Unexpected token, 'SELECT' in WHERE clause: {pred}"
+        if _parse_where(pred) is None:
+            return f"Unsupported WHERE clause: {pred}"
     return None
 
 
@@ -3745,6 +3763,11 @@ def _list_topic_rules(qp: dict) -> tuple:
 # device that has to fetch that job by id could then never reach it.
 _JOB_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 
+# schedulingConfig start/end times are minute-precision and carry no timezone
+# suffix: "must follow the format YYYY-MM-DDThh:mm" (measured eu-north-1
+# 2026-09-19).
+_JOB_SCHEDULE_TIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$")
+
 _JOB_TARGET_SELECTIONS = {"SNAPSHOT", "CONTINUOUS"}
 
 _JOB_EXECUTION_TERMINAL = {
@@ -3777,9 +3800,9 @@ def _jobs_now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def _jobs_ms_to_s(millis: int | None) -> float | None:
-    """Millisecond record stamp → epoch-seconds float for `timestamp` shapes."""
-    return None if millis is None else millis / 1000.0
+def _jobs_ms_to_s(millis: int | None) -> int | None:
+    """Millisecond record stamp → whole epoch seconds for `timestamp` shapes."""
+    return None if millis is None else millis // 1000
 
 
 def _jobs_ms_to_long_s(millis: int | None) -> int | None:
@@ -3870,6 +3893,65 @@ def _jobs_materialize_executions(job_id: str) -> None:
 def _jobs_materialize_all() -> None:
     for job_id in list(_jobs.keys()):
         _jobs_materialize_executions(job_id)
+
+
+def _jobs_timeout_minutes(execution: dict, job: dict | None) -> int | None:
+    """The in-progress timeout for one execution, in minutes, or None.
+
+    ``stepTimeoutInMinutes`` from the device's own UpdateJobExecution wins over
+    the job's ``timeoutConfig.inProgressTimeoutInMinutes``, which the reference
+    describes as applying to every execution of the job.
+    """
+    step = execution.get("stepTimeoutInMinutes")
+    if step is not None:
+        return step
+    cfg = (job or {}).get("timeoutConfig") or {}
+    minutes = cfg.get("inProgressTimeoutInMinutes")
+    return minutes if isinstance(minutes, int) else None
+
+
+def _jobs_seconds_before_timeout(execution: dict) -> int | None:
+    """Seconds an IN_PROGRESS execution has left before TIMED_OUT, or None when
+    no timeout applies. The device plane models this as a ``long``."""
+    if execution.get("status") != "IN_PROGRESS":
+        return None
+    minutes = _jobs_timeout_minutes(execution, _jobs.get(execution["jobId"]))
+    if not minutes:
+        return None
+    started = (execution.get("timeoutStartedAt")
+               or execution.get("startedAt")
+               or execution.get("lastUpdatedAt"))
+    if started is None:
+        return None
+    left = minutes * 60 - (_jobs_now_ms() - started) // 1000
+    return max(0, int(left))
+
+
+def _jobs_apply_timeout(execution: dict) -> dict:
+    """Flip an execution that has outstayed its timeout to TIMED_OUT.
+
+    Evaluated on read rather than by a timer, the way the broker's session
+    expiry is: "whenever a job execution remains in the IN_PROGRESS status for
+    longer than this interval, the job execution will fail and switch to the
+    terminal TIMED_OUT status".
+    """
+    if execution.get("status") != "IN_PROGRESS":
+        return execution
+    minutes = _jobs_timeout_minutes(execution, _jobs.get(execution["jobId"]))
+    if not minutes:
+        return execution
+    started = (execution.get("timeoutStartedAt")
+               or execution.get("startedAt")
+               or execution.get("lastUpdatedAt"))
+    if started is None:
+        return execution
+    if _jobs_now_ms() - started <= minutes * 60_000:
+        return execution
+    execution["status"] = "TIMED_OUT"
+    execution["lastUpdatedAt"] = _jobs_now_ms()
+    execution["versionNumber"] += 1
+    _jobs_maybe_complete(execution["jobId"])
+    return execution
 
 
 def _jobs_maybe_complete(job_id: str) -> None:
@@ -3991,6 +4073,33 @@ async def _create_job(job_id: str, payload: dict) -> tuple:
             + ", ".join(sorted(_JOB_TARGET_SELECTIONS)),
             400,
         )
+    sched_cfg = payload.get("schedulingConfig") or {}
+    for field in ("startTime", "endTime"):
+        value = sched_cfg.get(field)
+        if value is None:
+            continue
+        if not isinstance(value, str) or not _JOB_SCHEDULE_TIME_RE.match(value):
+            # Exact wording measured eu-north-1 2026-09-19; note the minute
+            # precision — an ISO stamp with seconds or a Z is refused.
+            return error_response_json(
+                "InvalidRequestException",
+                f"1 validation error detected: Provided time {value} UTC must "
+                "follow the format YYYY-MM-DDThh:mm.",
+                400,
+            )
+    timeout_cfg = payload.get("timeoutConfig") or {}
+    if timeout_cfg:
+        minutes = timeout_cfg.get("inProgressTimeoutInMinutes")
+        try:
+            minutes = int(minutes)
+        except (TypeError, ValueError):
+            minutes = None
+        if minutes is None or not 1 <= minutes <= 10080:
+            return error_response_json(
+                "InvalidRequestException",
+                "inProgressTimeoutInMinutes must be between 1 and 10080",
+                400,
+            )
     targets = payload.get("targets")
     if not targets:
         return error_response_json(
@@ -4014,6 +4123,23 @@ async def _create_job(job_id: str, payload: dict) -> tuple:
             )
         target_things.update(resolved)
     document = payload.get("document")
+    if isinstance(document, str) and len(document) > 32768:
+        return error_response_json(
+            "InvalidRequestException",
+            "document exceeds the maximum length of 32768", 400,
+        )
+    source = payload.get("documentSource")
+    if isinstance(source, str) and not 1 <= len(source) <= 1350:
+        return error_response_json(
+            "InvalidRequestException",
+            "documentSource must be between 1 and 1350 characters", 400,
+        )
+    if not document and not payload.get("documentSource"):
+        return error_response_json(
+            "InvalidRequestException",
+            "document is required if you do not specify a value for documentSource",
+            400,
+        )
     if not document and payload.get("documentSource"):
         # DELIBERATE DIVERGENCE: AWS fetches the document from the S3 URL and
         # serves its CONTENT to devices. MiniStack does not fetch it — it
@@ -4042,6 +4168,18 @@ async def _create_job(job_id: str, payload: dict) -> tuple:
         "presignedUrlConfig": payload.get("presignedUrlConfig") or {},
         "jobExecutionsRolloutConfig": payload.get("jobExecutionsRolloutConfig")
         or {},
+        # Modelled CreateJob members stored so DescribeJob echoes them. Storing
+        # is all this does: nothing acts on timeoutConfig or abortConfig, so no
+        # execution reaches TIMED_OUT and nothing aborts.
+        "abortConfig": payload.get("abortConfig"),
+        "timeoutConfig": payload.get("timeoutConfig"),
+        "jobExecutionsRetryConfig": payload.get("jobExecutionsRetryConfig"),
+        "namespaceId": payload.get("namespaceId"),
+        "jobTemplateArn": payload.get("jobTemplateArn"),
+        "documentParameters": payload.get("documentParameters"),
+        "schedulingConfig": payload.get("schedulingConfig"),
+        "destinationPackageVersions": payload.get("destinationPackageVersions"),
+        "tags": payload.get("tags"),
         "snapshotted": False,
     }
     _jobs_materialize_executions(job_id)
@@ -4107,6 +4245,26 @@ def _describe_job(job_id: str) -> tuple:
         job_doc["comment"] = job["comment"]
     if job.get("reasonCode") is not None:
         job_doc["reasonCode"] = job["reasonCode"]
+    if job.get("forceCanceled") is not None:
+        job_doc["forceCanceled"] = job["forceCanceled"]
+    # Members the Job shape models and CreateJob accepted. `tags` is NOT among
+    # them (tags are read through ListTagsForResource), so it is not echoed.
+    for member in (
+        "abortConfig", "jobExecutionsRetryConfig", "namespaceId", "jobTemplateArn",
+        "documentParameters", "destinationPackageVersions",
+    ):
+        if job.get(member) is not None:
+            job_doc[member] = job[member]
+    # timeoutConfig and schedulingConfig come back as {} even when unset, unlike
+    # abortConfig, which is omitted (captured eu-north-1 2026-09-19).
+    job_doc["timeoutConfig"] = job.get("timeoutConfig") or {}
+    job_doc["schedulingConfig"] = job.get("schedulingConfig") or {}
+    # isConcurrent is false in every steady state (captured eu-north-1
+    # 2026-09-19 with a QUEUED, an IN_PROGRESS and a SUCCEEDED execution). It is
+    # true only inside the rollout/cancel window the reference describes, which
+    # this emulator does not model. processingTargets is null throughout the same
+    # capture, so it stays omitted rather than echoing the target ARNs.
+    job_doc["isConcurrent"] = False
     response = {"job": job_doc}
     if job.get("documentSource") is not None:
         response["documentSource"] = job["documentSource"]
@@ -4181,6 +4339,8 @@ async def _cancel_job(job_id: str, payload: dict, qp: dict) -> tuple:
     force = _qp_bool(qp, "force")
     now = _jobs_now_ms()
     job["status"] = "CANCELED"
+    if force:
+        job["forceCanceled"] = True
     job["lastUpdatedAt"] = now
     job["completedAt"] = now
     if payload.get("comment") is not None:
@@ -4268,6 +4428,7 @@ def _list_job_executions_for_thing(thing: str, qp: dict) -> tuple:
             "queuedAt": _jobs_ms_to_s(execution["queuedAt"]),
             "lastUpdatedAt": _jobs_ms_to_s(execution["lastUpdatedAt"]),
             "executionNumber": execution["executionNumber"],
+            "retryAttempt": execution.get("retryAttempt", 0),
         }
         if execution.get("startedAt") is not None:
             summary["startedAt"] = _jobs_ms_to_s(execution["startedAt"])
@@ -4363,6 +4524,9 @@ def jobs_pending_for_thing(thing_name: str) -> list[dict]:
     creation gets its execution here, on the read that first needs it.
     """
     _jobs_materialize_all()
+    for execution in _job_executions.values():
+        if execution["thingName"] == thing_name:
+            _jobs_apply_timeout(execution)
     pending = [
         dict(execution)
         for execution in _job_executions.values()
@@ -4413,7 +4577,9 @@ def jobs_describe_execution(thing_name: str, job_id: str) -> dict | None:
     """One execution (a copy), materializing the job's targets first."""
     _jobs_materialize_executions(job_id)
     execution = _job_executions.get((thing_name, job_id))
-    return None if execution is None else dict(execution)
+    if execution is None:
+        return None
+    return dict(_jobs_apply_timeout(execution))
 
 
 def jobs_job_document(job_id: str) -> str:
@@ -4441,6 +4607,7 @@ def jobs_update_execution(
     status,
     expected_version=None,
     status_details: dict | None = None,
+    step_timeout_minutes=None,
 ) -> tuple:
     """Apply a device-reported status to an execution.
 
@@ -4479,11 +4646,12 @@ def jobs_update_execution(
             409,
         )
     if status not in _DEVICE_SETTABLE_STATUSES:
+        # InvalidStateTransitionException, not InvalidRequestException
+        # (measured eu-north-1 2026-09-19).
         return None, error_response_json(
-            "InvalidRequestException",
-            f"A device cannot set status {status} via UpdateJobExecution; "
-            "allowed statuses are IN_PROGRESS, SUCCEEDED, FAILED, and REJECTED",
-            400,
+            "InvalidStateTransitionException",
+            f"The status of job execution cannot be changed to be {status}",
+            409,
         )
     now = _jobs_now_ms()
     execution["status"] = status
@@ -4491,6 +4659,11 @@ def jobs_update_execution(
         execution["statusDetails"] = dict(status_details)
     if status == "IN_PROGRESS" and execution.get("startedAt") is None:
         execution["startedAt"] = now
+    if status == "IN_PROGRESS" and step_timeout_minutes is not None:
+        # The device's own step timeout, reset every time it re-reports
+        # IN_PROGRESS with a new value.
+        execution["stepTimeoutInMinutes"] = step_timeout_minutes
+        execution["timeoutStartedAt"] = now
     execution["lastUpdatedAt"] = now
     execution["versionNumber"] += 1
     _jobs_maybe_complete(job_id)
@@ -4516,6 +4689,9 @@ def jobs_execution_view(execution: dict, document: str | dict | None) -> dict:
     }
     if execution.get("startedAt") is not None:
         view["startedAt"] = _jobs_ms_to_long_s(execution["startedAt"])
+    remaining = _jobs_seconds_before_timeout(execution)
+    if remaining is not None:
+        view["approximateSecondsBeforeTimedOut"] = remaining
     if document is not None:
         view["jobDocument"] = document
     return view
@@ -5344,7 +5520,9 @@ async def _dispatch_rule_error_action(
         "topic": topic,
         # The emulator's publish path carries no CloudWatch trace id.
         "cloudwatchTraceId": "",
-        "clientId": client_id or "",
+        # "N/A", not "" — and not clientid()'s lowercase "n/a" (measured eu-north-1 2026-09-19).
+        "clientId": client_id or "N/A",
+        "sourceIp": _publish_source_ip.get(),
         "base64OriginalPayload": base64.b64encode(payload).decode("ascii"),
         "failures": failures,
     }
@@ -5359,6 +5537,40 @@ async def _dispatch_rule_error_action(
             type(exc).__name__,
             exc,
         )
+
+
+# failedResource is the resource the action targeted, a different member per type.
+_RULE_ACTION_RESOURCE_KEYS = {
+    "dynamoDBv2": ("putItem", "tableName"),
+    "sns": ("targetArn",),
+    "sqs": ("queueUrl",),
+    "republish": ("topic",),
+    "lambda": ("functionArn",),
+}
+
+
+def _rule_action_name(action_type: str) -> str:
+    """``failedAction`` for an action type: the key capitalised, plus ``Action``.
+    ``DynamoDBv2Action`` (measured eu-north-1 2026-09-19); ``S3Action`` is the reference's own example."""
+    if not action_type:
+        return ""
+    return action_type[0].upper() + action_type[1:] + "Action"
+
+
+def _rule_action_resource(action: dict, action_type: str) -> str:
+    """The resource an action names, for the errorAction document's
+    ``failedResource``. Empty when the action type does not name one."""
+    spec = action.get(action_type)
+    if not isinstance(spec, dict):
+        return ""
+    for key in _RULE_ACTION_RESOURCE_KEYS.get(action_type, ()):
+        value = spec.get(key)
+        if isinstance(value, dict):
+            spec = value
+            continue
+        if isinstance(value, str):
+            return value
+    return ""
 
 
 async def _run_rule_actions(
@@ -5408,9 +5620,11 @@ async def _run_rule_actions(
                 type(exc).__name__,
                 exc,
             )
-            failures.append(
-                {"action": action_type, "errorMessage": f"{type(exc).__name__}: {exc}"}
-            )
+            failures.append({
+                "failedAction": _rule_action_name(action_type),
+                "failedResource": _rule_action_resource(action, action_type),
+                "errorMessage": f"{type(exc).__name__}: {exc}",
+            })
     if failures:
         await _dispatch_rule_error_action(
             account_id, region, rule, topic, payload, client_id, failures
@@ -6320,6 +6534,14 @@ _delivery_properties: contextvars.ContextVar[bytes] = contextvars.ContextVar(
     "_iot_delivery_properties", default=b""
 )
 
+# The publisher's IP, for the errorAction document's `sourceIp`. Carried the
+# same way as the two below: the publish path is several frames deep and only
+# the error document needs it.
+_publish_source_ip: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "_iot_publish_source_ip", default="127.0.0.1"
+)
+
+
 # The RETAIN flag one delivery goes out with, carried the same way and for the
 # same reason. It is resolved per subscriber rather than per message, because
 # Retain As Published makes it a property of the subscription: two subscribers
@@ -7200,6 +7422,9 @@ async def handle_websocket(
     scope: dict, receive, send, account_id: str, region: str
 ) -> None:
     """Drive an MQTT-over-WebSocket session."""
+    client = scope.get("client")
+    if client:
+        _publish_source_ip.set(client[0])
     msg = await receive()
     if msg.get("type") != "websocket.connect":
         return
@@ -7546,6 +7771,11 @@ def _mtls_build_ssl_context() -> ssl.SSLContext:
     _mtls_refresh_trust_anchors(ctx)
     ctx.sni_callback = _mtls_on_client_hello
     return ctx
+
+
+def mtls_is_listening() -> bool:
+    """Whether the mTLS listener holds a bound socket."""
+    return _mtls_server is not None
 
 
 async def mtls_start() -> None:

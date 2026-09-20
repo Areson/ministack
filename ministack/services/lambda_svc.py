@@ -1680,14 +1680,44 @@ def _layer_access_denied(layer_arn: str):
     )
 
 
+# The extensions AWS publishes from its own accounts and grants
+# lambda:GetLayerVersion on to everyone. Keyed by LAYER NAME, not by publisher
+# account: the name is stable while the account differs in every region, so one
+# short list replaces ~190 account ids that go stale as regions are added.
+_AWS_PUBLISHED_LAYER_PREFIXES = (
+    "LambdaInsightsExtension",
+    "AWS-Parameters-and-Secrets-Lambda-Extension",
+    "AWS-AppConfig-Extension",
+    "AWSOpenTelemetryDistro",
+    "aws-otel-",
+    "AWSSDKPandas-",
+)
+
+
+def _is_aws_published_layer(layer_name: str) -> bool:
+    return layer_name.startswith(_AWS_PUBLISHED_LAYER_PREFIXES)
+
+
 def _resolve_cross_account_layer(layer_arn: str, spec, name_and_version):
-    """Resolve another account's layer version through its stored grant."""
+    """Another account's layer through its grant; an unknown account passes by
+    name, and the bytes are not available offline (CodeSize 0, does not run)."""
     if spec.region != get_region():
         return _layer_access_denied(layer_arn)
     layer_name, version = name_and_version
     vc, _ = _find_layer_version(layer_name, version, spec.account_id, spec.region)
     if vc is not None and _layer_policy_allows(vc, get_account_id()):
         return vc, None
+    if vc is None and _is_aws_published_layer(layer_name):
+        logger.warning(
+            "Layer %s is an AWS-published extension: the reference resolves so "
+            "the stack deploys, but the bytes are not available offline and the "
+            "extension will not run", layer_arn,
+        )
+        return {
+            "LayerVersionArn": layer_arn,
+            "Version": version,
+            "Content": {"CodeSize": 0},
+        }, None
     return _layer_access_denied(layer_arn)
 
 
@@ -3457,7 +3487,7 @@ def _ensure_reaper_thread() -> None:
 # Active / Successful asynchronously when the runtime is ready. Real AWS takes
 # seconds to tens of seconds (image pull time for Image type); we use a short
 # delay so local integration tests see the transition without spinning.
-_LAMBDA_STATE_TRANSITION_DELAY = float(os.environ.get("LAMBDA_STATE_TRANSITION_SECONDS", "0.5"))
+_LAMBDA_STATE_TRANSITION_DELAY = 0.5
 
 
 def _schedule_state_transition(func_name: str, delay: float) -> None:
@@ -6342,6 +6372,9 @@ def _find_layer_version(
 # rejected with PreconditionFailedException (412) rather than silently
 # clobbering a policy that changed underneath them.
 _LAYER_PRINCIPAL_RE = re.compile(r"^(\d{12}|\*|arn:aws[a-zA-Z-]*:iam::\d{12}:root)$")
+# The other two modeled constraints on AddLayerVersionPermission.
+_LAYER_ORG_ID_RE = re.compile(r"^o-[a-z0-9]{10,32}$")
+_LAYER_STATEMENT_ID_RE = re.compile(r"^[a-zA-Z0-9\-_]{1,100}$")
 
 
 def _layer_policy_revision_id(vc: dict) -> str:
@@ -6434,12 +6467,28 @@ def _add_layer_version_permission(
             "The principal must be * when an organization id is provided.",
             400,
         )
+    if org_id and not _LAYER_ORG_ID_RE.match(org_id):
+        return error_response_json(
+            "ValidationException",
+            f"1 validation error detected: Value '{org_id}' at 'organizationId' failed to "
+            "satisfy constraint: Member must satisfy regular expression pattern: "
+            r"o-[a-z0-9]{10,32}",
+            400,
+        )
 
     err = _layer_policy_revision_mismatch(vc, query_params)
     if err:
         return err
 
     sid = data.get("StatementId", "")
+    if not _LAYER_STATEMENT_ID_RE.match(sid):
+        return error_response_json(
+            "ValidationException",
+            f"1 validation error detected: Value '{sid}' at 'statementId' failed to satisfy "
+            "constraint: Member must satisfy regular expression pattern: "
+            r"([a-zA-Z0-9-_]+)",
+            400,
+        )
     policy = vc.setdefault("_policy", {"Version": "2012-10-17", "Id": "default", "Statement": []})
     for s in policy["Statement"]:
         if s.get("Sid") == sid:

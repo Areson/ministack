@@ -5335,7 +5335,8 @@ def test_cfn_wafv2_web_acl_uses_canonical_arn(
             },
         },
         "Outputs": {
-            "AclId": {"Value": {"Ref": "Acl"}},
+            "AclRef": {"Value": {"Ref": "Acl"}},
+            "AclId": {"Value": {"Fn::GetAtt": ["Acl", "Id"]}},
             "AclArn": {"Value": {"Fn::GetAtt": ["Acl", "Arn"]}},
         },
     }
@@ -5349,6 +5350,8 @@ def test_cfn_wafv2_web_acl_uses_canonical_arn(
             f"arn:aws:wafv2:{arn_region}:000000000000:"
             f"{arn_segment}/webacl/{acl_name}/{outputs['AclId']}"
         )
+        # Ref is name|id|scope, not the bare id.
+        assert outputs["AclRef"] == f"{acl_name}|{outputs['AclId']}|{scope}"
         acls = wafv2.list_web_acls(Scope=scope)["WebACLs"]
         assert outputs["AclArn"] in {acl["ARN"] for acl in acls}
         tags = wafv2.list_tags_for_resource(ResourceARN=outputs["AclArn"])
@@ -6520,6 +6523,7 @@ def _cfn_web_acl_template(uid, description, scope="REGIONAL", metric="cfnacl"):
         },
         "Outputs": {
             "AclRef": {"Value": {"Ref": "Acl"}},
+            "AclId": {"Value": {"Fn::GetAtt": ["Acl", "Id"]}},
             "AclArn": {"Value": {"Fn::GetAtt": ["Acl", "Arn"]}},
         },
     })
@@ -6538,14 +6542,16 @@ def test_cfn_wafv2_web_acl_update_keeps_its_id_and_arn(cfn, wafv2):
     try:
         stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
-        acl_id = _output(stack, "AclRef")
+        acl_id = _output(stack, "AclId")
+        acl_ref = _output(stack, "AclRef")
         acl_arn = _output(stack, "AclArn")
 
         cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_web_acl_template(
             uid, "after", metric="cfnaclrenamed"))
         stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
-        assert _output(stack, "AclRef") == acl_id
+        assert _output(stack, "AclRef") == acl_ref
+        assert _output(stack, "AclId") == acl_id
         assert _output(stack, "AclArn") == acl_arn
         acl = wafv2.get_web_acl(Name=f"cfn-acl-{uid}", Scope="REGIONAL",
                                 Id=acl_id)["WebACL"]
@@ -7037,7 +7043,7 @@ def test_cfn_replacing_change_under_custom_name_fails_loudly(
             _cfn_web_acl_template(uid, "d"),
             _cfn_web_acl_template(uid, "d", scope="CLOUDFRONT"),
             lambda st: [a["Id"] for a in wafv2.list_web_acls(Scope="REGIONAL")["WebACLs"]
-                        if a["Name"] == f"cfn-acl-{uid}"] == [_output(st, "AclRef")],
+                        if a["Name"] == f"cfn-acl-{uid}"] == [_output(st, "AclId")],
             True),
         "vault_key": (
             _cfn_backup_template(uid, 1, "a"),
@@ -7107,6 +7113,7 @@ def _cfn_auto_named_template(uid, *, lb_type="application", port=80,
             "LbRef": {"Value": {"Ref": "LB"}},
             "TgRef": {"Value": {"Ref": "TG"}},
             "AclRef": {"Value": {"Ref": "Acl"}},
+            "AclId": {"Value": {"Fn::GetAtt": ["Acl", "Id"]}},
         },
     })
 
@@ -7127,7 +7134,7 @@ def test_cfn_replacing_property_replaces_an_auto_named_resource(
         assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
         lb_arn = _output(stack, "LbRef")
         tg_arn = _output(stack, "TgRef")
-        acl_id = _output(stack, "AclRef")
+        acl_id = _output(stack, "AclId")
 
         cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_auto_named_template(
             uid, lb_type="network", port=8080, scope="CLOUDFRONT"))
@@ -7135,7 +7142,7 @@ def test_cfn_replacing_property_replaces_an_auto_named_resource(
         assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
         new_lb = _output(stack, "LbRef")
         new_tg = _output(stack, "TgRef")
-        new_acl = _output(stack, "AclRef")
+        new_acl = _output(stack, "AclId")
         assert new_lb != lb_arn
         assert new_tg != tg_arn
         assert new_acl != acl_id
@@ -22898,8 +22905,11 @@ def test_cfn_rules_cdk_check_bootstrap_version(cfn, ssm):
 def test_cfn_rules_condition_and_list_functions(cfn):
     """A rule whose RuleCondition is false is skipped; Fn::Contains,
     Fn::EachMemberEquals and Fn::EachMemberIn see a CommaDelimitedList
-    parameter as a list of trimmed members; Fn::And, Fn::Or, Fn::Equals and
-    Fn::If nest; the pseudo parameters resolve."""
+    parameter as a list of trimmed members; Fn::And, Fn::Or and Fn::Equals
+    nest; the pseudo parameters resolve. Fn::If is deliberately absent: a real
+    account refuses it in the Rules block ("Following functions are not
+    supported in the Rules block of the template: [Fn::If]", us-east-1
+    2026-09-19), even though the resource reference lists it."""
     uid = _uuid_mod.uuid4().hex[:8]
     params = {
         "Env": {"Type": "String", "Default": "test"},
@@ -22924,9 +22934,7 @@ def test_cfn_rules_condition_and_list_functions(cfn):
             {"Fn::Or": [{"Fn::Equals": [{"Ref": "AWS::Region"}, "us-east-1"]},
                         {"Fn::Equals": [{"Ref": "AWS::AccountId"}, "000000000000"]}]},
             {"Fn::Not": [{"Fn::Equals": [{"Ref": "AWS::Partition"}, "aws-cn"]}]},
-            {"Fn::Contains": [{"Ref": "Zones"},
-                              {"Fn::If": [{"Fn::Equals": [{"Ref": "Env"}, "test"]},
-                                          "us-east-1b", "us-east-1z"]}]},
+            {"Fn::Contains": [{"Ref": "Zones"}, "us-east-1b"]},
         ]}}]},
     }
     body = _rules_template(rules, params)
@@ -23954,3 +23962,57 @@ def test_cfn_language_extensions_condition_from_an_intrinsic(cfn, ssm):
             ssm.get_parameter(Name=prefix + "/beta")
     finally:
         _delete_cfn_test_stack(cfn, name)
+
+
+def test_cfn_s3_bucket_lambda_notification_reads_back(cfn, s3, lam):
+    """An AWS::S3::Bucket NotificationConfiguration with a LambdaConfigurations
+    entry has to be readable through GetBucketNotificationConfiguration. The CFN
+    property names differ from the API's (Function, singular Event), and the wire
+    element names differ again -- the S3 model spells the lambda list
+    CloudFunctionConfiguration -- so a config could be stored and delivered yet
+    come back empty to every SDK."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-s3-notif-{uid}"
+    bucket = f"cfn-s3-notif-{uid}"
+    fn_name = f"cfn-s3-notif-{uid}"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", "def handler(event, context):\n    return {}\n")
+    lam.create_function(
+        FunctionName=fn_name, Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role", Handler="index.handler",
+        Code={"ZipFile": buf.getvalue()},
+    )
+    template = json.dumps({"Resources": {
+        "Permission": {"Type": "AWS::Lambda::Permission", "Properties": {
+            "FunctionName": fn_name, "Action": "lambda:InvokeFunction",
+            "Principal": "s3.amazonaws.com",
+            "SourceAccount": {"Ref": "AWS::AccountId"}}},
+        "Bucket": {"Type": "AWS::S3::Bucket", "Properties": {
+            "BucketName": bucket,
+            "NotificationConfiguration": {"LambdaConfigurations": [{
+                "Function": {"Fn::Sub":
+                             "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:"
+                             f"function:{fn_name}"},
+                "Event": "s3:ObjectCreated:*",
+                "Filter": {"S3Key": {"Rules": [{"Name": "prefix", "Value": "in/"}]}},
+            }]}}},
+    }})
+    cfn.create_stack(StackName=stack_name, TemplateBody=template)
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        configs = s3.get_bucket_notification_configuration(
+            Bucket=bucket)["LambdaFunctionConfigurations"]
+        assert len(configs) == 1, configs
+        assert configs[0]["LambdaFunctionArn"].endswith(f"function:{fn_name}")
+        assert configs[0]["Events"] == ["s3:ObjectCreated:*"]
+        assert configs[0]["Id"]
+        assert configs[0]["Filter"]["Key"]["FilterRules"] == [
+            {"Name": "prefix", "Value": "in/"}]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        try:
+            lam.delete_function(FunctionName=fn_name)
+        except ClientError:
+            pass

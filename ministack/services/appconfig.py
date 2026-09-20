@@ -719,6 +719,21 @@ def _start_configuration_session(body):
     return _json(201, {"InitialConfigurationToken": token})
 
 
+def _retrieval_time_content(app_id, profile_id, content: bytes) -> bytes:
+    """Feature flags are served in retrieval-time format: the `values` map
+    lifted to the top level. Anything else is served verbatim."""
+    profile = _config_profiles.get(f"{app_id}/{profile_id}") or {}
+    if profile.get("Type") != "AWS.AppConfig.FeatureFlags":
+        return content
+    try:
+        document = json.loads(content)
+    except (ValueError, TypeError):
+        return content
+    if not isinstance(document, dict) or not isinstance(document.get("values"), dict):
+        return content
+    return json.dumps(document["values"]).encode("utf-8")
+
+
 def _get_latest_configuration(token):
     session = _sessions.get(token)
     if not session:
@@ -750,6 +765,7 @@ def _get_latest_configuration(token):
             raw = version_record["Content"]
             content = raw if isinstance(raw, bytes) else raw.encode("utf-8")
             content_type = version_record.get("ContentType", "application/octet-stream")
+            content = _retrieval_time_content(app_id, profile_id, content)
 
     next_token = uuid.uuid4().hex
     _sessions[next_token] = session.copy()

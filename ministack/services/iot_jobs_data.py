@@ -199,6 +199,23 @@ def _describe_execution(thing: str, job_id: str, qp: dict) -> tuple:
 
 
 async def _update_execution(thing: str, job_id: str, payload: dict) -> tuple:
+    # Nothing re-queues here, so only execution number 1 exists.
+    execution_number = payload.get("executionNumber")
+    if execution_number is not None:
+        try:
+            execution_number = int(execution_number)
+        except (TypeError, ValueError):
+            return error_response_json(
+                "InvalidRequestException",
+                f"Invalid executionNumber: {execution_number!r}", 400,
+            )
+        current = _iot_module.jobs_describe_execution(thing, job_id)
+        if current is not None and execution_number != current["executionNumber"]:
+            return error_response_json(
+                "ResourceNotFoundException",
+                f"No job execution {execution_number} found for thing {thing} "
+                f"and job {job_id}", 404,
+            )
     prev_next = _iot_module.jobs_first_pending_job_id(thing)
     execution, error = _iot_module.jobs_update_execution(
         thing,
@@ -206,6 +223,7 @@ async def _update_execution(thing: str, job_id: str, payload: dict) -> tuple:
         status=payload.get("status"),
         expected_version=payload.get("expectedVersion"),
         status_details=payload.get("statusDetails"),
+        step_timeout_minutes=payload.get("stepTimeoutInMinutes"),
     )
     if error:
         return error

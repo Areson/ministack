@@ -30,14 +30,20 @@ _MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
 _MINISTACK_PORT = os.environ.get("GATEWAY_PORT", "4566")
 AUTH = os.environ.get("AUTH", "false").lower() == "true"
 
-_VERSION = os.environ.get("MINISTACK_VERSION") or "dev"
-if _VERSION == "dev":
-    try:
-        from importlib.metadata import version as _pkg_version
+_VERSION = os.environ.get("MINISTACK_VERSION") or ""
 
-        _VERSION = _pkg_version("ministack")
-    except Exception:
-        pass
+
+def _version() -> str:
+    """The reported version, resolved on first ask and cached."""
+    global _VERSION
+    if not _VERSION:
+        try:
+            from importlib.metadata import version as _pkg_version
+
+            _VERSION = _pkg_version("ministack")
+        except Exception:
+            _VERSION = "dev"
+    return _VERSION
 
 # Matches host headers like "{apiId}.execute-api.<host>" or "{apiId}.execute-api.<host>:4566"
 _EXECUTE_API_RE = re.compile(r"^([a-f0-9]{8})\.execute-api\." + re.escape(_MINISTACK_HOST) + r"(?::\d+)?$")
@@ -773,7 +779,8 @@ def _handle_health_request(path: str, request_id: str):
             {
                 "services": {s: "available" for s in SERVICE_HANDLERS},
                 "edition": os.environ.get("MINISTACK_EDITION", "light"),
-                "version": _VERSION,
+                "version": _version(),
+                "iot_mtls": _iot_mtls_state,
                 "ready_scripts": dict(_ready_scripts_state),
             }
         ).encode(),
@@ -784,15 +791,20 @@ def _handle_ready_request(path: str, request_id: str):
     """Return readiness state once ready.d scripts have completed."""
     if path != "/_ministack/ready":
         return None
-    ready = _ready_scripts_state["status"] == "completed"
+    # The mTLS listener binds after the HTTP port, so readiness covers it: a
+    # consumer polling one endpoint does not race the MQTT port.
+    ready = (_ready_scripts_state["status"] == "completed"
+             and _iot_mtls_state != "starting")
     status = 200 if ready else 503
+    body = dict(_ready_scripts_state)
+    body["iot_mtls"] = _iot_mtls_state
     return (
         status,
         {
             "Content-Type": "application/json",
             "x-amzn-requestid": request_id,
         },
-        json.dumps(dict(_ready_scripts_state)).encode(),
+        json.dumps(body).encode(),
     )
 
 
@@ -870,7 +882,9 @@ async def _handle_cognito_get_request(method: str, path: str, headers: dict, que
                 if cognito._get_pool_unscoped(pool_id) is not None:
                     region = extract_region(headers) or "us-east-1"
                     host = headers.get("host") or headers.get("Host")
-                    return cognito.well_known_openid_configuration(pool_id, region, host)
+                    scheme = headers.get("x-forwarded-proto") or "http"
+                    return cognito.well_known_openid_configuration(
+                        pool_id, region, host, scheme)
 
     if path == "/oauth2/authorize" and method == "GET":
         return _get_module("cognito").handle_oauth2_authorize(method, path, headers, query_params)
@@ -1114,7 +1128,33 @@ async def _handle_pre_body_request(method: str, path: str, headers: dict, query_
     if response is not None:
         return response
 
+    response = _handle_rds_ca_request(method, path)
+    if response is not None:
+        return response
+
     return await _handle_admin_reset(path, method, query_params)
+
+
+def _handle_rds_ca_request(method: str, path: str):
+    """`GET /_ministack/rds/ca.pem` returns the CA that signs DB server
+    certificates, the local stand-in for AWS's certificate bundle."""
+    if path != "/_ministack/rds/ca.pem" or method != "GET":
+        return None
+    try:
+        from ministack.services import rds
+
+        cert_pem = rds.pg_ca_cert_pem()
+    except Exception as e:
+        return (
+            503,
+            {"Content-Type": "application/json"},
+            json.dumps({"message": str(e)}).encode(),
+        )
+    return (
+        200,
+        {"Content-Type": "application/x-pem-file"},
+        cert_pem.encode(),
+    )
 
 
 def _handle_iot_ca_request(method: str, path: str):
@@ -1389,13 +1429,29 @@ async def _handle_s3_control_request(path: str, method: str, body: bytes, query_
             b"{}",
         )
 
+    # An undefined /v20180820 path answers 400 InvalidURI inside an
+    # <ErrorResponse> wrapper, with <URI> echoing the bad segment (measured eu-north-1 2026-09-19).
+    from xml.sax.saxutils import escape as _xml_esc
+
+    bad_uri = path.split("/v20180820/", 1)[-1] if "/v20180820/" in path else path.lstrip("/")
+    unsupported = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<ErrorResponse><Error>"
+        "<Code>InvalidURI</Code>"
+        "<Message>Couldn't parse the specified URI.</Message>"
+        f"<URI>{_xml_esc(bad_uri)}</URI>"
+        "</Error>"
+        f"<RequestId>{request_id}</RequestId>"
+        f"<HostId>{uuid.uuid4().hex}</HostId>"
+        "</ErrorResponse>"
+    ).encode()
     return (
-        200,
+        400,
         {
-            "Content-Type": "application/json",
+            "Content-Type": "application/xml",
             "x-amzn-requestid": request_id,
         },
-        b"{}",
+        unsupported,
     )
 
 
@@ -2457,6 +2513,10 @@ async def app(scope, receive, send):
         else:
             headers[key] = decoded
 
+    # USE_SSL terminates TLS here, so no proxy sets the header; fill it in.
+    if scope.get("scheme") == "https":
+        headers.setdefault("x-forwarded-proto", "https")
+
     request_id = str(uuid.uuid4())
 
     # If a /_ministack/reset is in flight, wait for it to finish before
@@ -2532,8 +2592,34 @@ async def app(scope, receive, send):
 # ---------------------------------------------------------------------------
 
 
+# The boot task that imports iot and binds the mTLS listener, and the state
+# /_ministack/health and /_ministack/ready report for it.
+_iot_mtls_task = None
+_iot_mtls_state = "disabled"
+
+
+async def _start_iot_mtls():
+    """Import the iot module and bind the mTLS MQTT listener."""
+    global _iot_mtls_state
+    try:
+        from ministack.services import iot as _iot_svc
+
+        await _iot_svc.mtls_start()
+        if _iot_svc.mtls_is_listening():
+            _iot_mtls_state = "listening"
+        else:
+            # mtls_start returns without binding when the listener is off
+            # (cryptography missing, or IOT_MTLS_ENABLED=0), which is not a
+            # failure and must not report a healthy MiniStack as degraded.
+            _iot_mtls_state = "degraded" if _iot_svc.mtls_enabled() else "disabled"
+    except Exception as e:
+        _iot_mtls_state = "degraded"
+        logger.warning("IoT mTLS listener startup failed: %s", e)
+
+
 async def _handle_lifespan(scope, receive, send):
     """Handle ASGI lifespan events."""
+    global _iot_mtls_task, _iot_mtls_state
     while True:
         message = await receive()
         if message["type"] == "lifespan.startup":
@@ -2624,12 +2710,12 @@ async def _handle_lifespan(scope, receive, send):
             if _iot_mtls_env in ("0", "false", "no", "off"):
                 logger.debug("IOT_MTLS_ENABLED=%s — skipping iot module import.", _iot_mtls_env)
             else:
-                try:
-                    from ministack.services import iot as _iot_svc
-
-                    await _iot_svc.mtls_start()
-                except Exception as e:
-                    logger.warning("IoT mTLS listener startup failed: %s", e)
+                # Off the startup sequence: importing iot and minting the
+                # broker certificate is the bulk of a boot. The listener comes
+                # up after the HTTP port; /_ministack/ready waits for it and
+                # shutdown joins the task before stopping the listener.
+                _iot_mtls_state = "starting"
+                _iot_mtls_task = asyncio.create_task(_start_iot_mtls())
             # Start DSQL wire proxies for clusters restored from persistence.
             # Guarded on the module already being loaded (i.e. it had state
             # or was used this boot) so we never import dsql just for this.
@@ -2673,6 +2759,11 @@ async def _handle_lifespan(scope, receive, send):
                 await transfer.sftp_stop()
             except Exception as e:
                 logger.debug("Transfer SFTP shutdown error: %s", e)
+            if _iot_mtls_task is not None:
+                try:
+                    await _iot_mtls_task
+                except Exception as e:
+                    logger.debug("IoT mTLS startup error: %s", e)
             _iot_mod = sys.modules.get("ministack.services.iot")
             if _iot_mod is not None:
                 try:
