@@ -40,8 +40,11 @@ int main(int argc, char **argv) {
 }
 ''')
     binary = root / "client"
-    subprocess.run([compiler, "-std=c++11", "-Wall", "-Wextra", "-Werror",
-                    "-I", str(SOURCE), str(source), "-lcurl", "-o", str(binary)], check=True, capture_output=True)
+    compiled = subprocess.run([compiler, "-std=c++11", "-Wall", "-Wextra", "-Werror",
+                               "-I", str(SOURCE), str(source), "-lcurl", "-o", str(binary)],
+                              capture_output=True, text=True)
+    if compiled.returncode:
+        pytest.fail(f"Native broker client compilation failed:\n{compiled.stdout}\n{compiled.stderr}", pytrace=False)
     return binary
 
 

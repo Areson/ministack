@@ -38,11 +38,18 @@ tokens at 64 KiB, and JSON requests at the broker's 70 KiB limit. Errors deny
 access without logging credentials. The callback uses HTTP on a trusted internal
 network; it must not cross an untrusted network without transport protection.
 
-Before stage 8 enables real logins, the MySQL connection must require TLS (for
-example through the IAM account's `REQUIRE SSL` setting). This callback cannot
-attest to client TLS. Existing database-user checks and SQL privileges must
-remain in force. TLS refusal, token expiry on new logins, and continued use of
-already-established sessions are required end-to-end acceptance tests.
+Stage 8 must require TLS for IAM-authenticated MySQL logins when `AUTH=true`.
+With `AUTH` unset or false, it must preserve permissive transport behavior and
+add no TLS requirement. Non-IAM users' transport requirements remain unchanged;
+do not unconditionally add `REQUIRE SSL` to IAM accounts. This callback cannot
+attest to client TLS, so stage 8 must establish that enforcement at the MySQL
+connection boundary. Protection of the plugin-to-broker transport is a separate
+concern from client-to-MySQL TLS.
+
+Existing database-user checks and SQL privileges must remain in force.
+End-to-end acceptance tests must cover TLS refusal and token expiry on new
+IAM logins with `AUTH=true`, permissive transport with `AUTH` unset or false,
+and continued use of already-established sessions.
 
 Native callback tests run offline with a C++ compiler and libcurl development
 headers/libraries (for example `g++` and `libcurl4-openssl-dev` on Debian):
